@@ -1,0 +1,23 @@
+{
+	"targets": {
+		"debug": {
+			"outFile": "build/debug.wasm",
+			"textFile": "build/debug.wat",
+			"sourceMap": true,
+			"debug": true
+		},
+		"release": {
+			"outFile": "build/release.wasm",
+			"textFile": "build/release.wat",
+			"sourceMap": false,
+			"optimizeLevel": 3,
+			"shrinkLevel": 1,
+			"converge": false,
+			"noAssert": true,
+			"enable": ["simd"],
+			"initialMemory": 100,
+			"maximumMemory": 32768
+		}
+	},
+	"options": {}
+}

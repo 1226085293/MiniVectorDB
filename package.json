@@ -1,0 +1,35 @@
+{
+	"name": "mini-vector-db",
+	"version": "1.0.0",
+	"description": "A lightweight SIMD-optimized vector database using Node.js and AssemblyScript",
+	"main": "dist/index.js",
+	"types": "dist/index.d.ts",
+	"files": [
+		"dist",
+		"build"
+	],
+	"scripts": {
+		"asbuild:debug": "asc assembly/index.ts --target debug",
+		"asbuild:release": "asc assembly/index.ts --target release",
+		"asbuild": "npm run asbuild:release",
+		"build:ts": "tsc",
+		"build": "npm run asbuild && npm run build:ts",
+		"start": "ts-node src/api/server.ts",
+		"test": "ts-node tests/persistence_test.ts"
+	},
+	"dependencies": {
+		"@xenova/transformers": "^2.16.0",
+		"@assemblyscript/loader": "^0.27.0",
+		"@fastify/cors": "^10.0.0",
+		"fastify": "^5.0.0",
+		"lokijs": "^1.5.12"
+	},
+	"devDependencies": {
+		"@types/lokijs": "^1.5.7",
+		"@types/node": "^18.0.0",
+		"assemblyscript": "^0.27.0",
+		"ts-node": "^10.9.1",
+		"typescript": "^5.0.0"
+	},
+	"type": "commonjs"
+}
