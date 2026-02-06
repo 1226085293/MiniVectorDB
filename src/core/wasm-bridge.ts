@@ -16,7 +16,12 @@ export class WasmBridge {
 		ef: number;
 		efSearch?: number;
 		capacity?: number;
+		seed?: number;
 	} | null = null;
+
+	// ✅ Reusable scratch buffer inside WASM linear memory (Int8)
+	private scratchI8Ptr: number = 0;
+	private scratchI8Cap: number = 0; // bytes
 
 	constructor() {}
 
@@ -26,6 +31,7 @@ export class WasmBridge {
 		ef: number;
 		efSearch?: number;
 		capacity?: number;
+		seed?: number;
 	}) {
 		const wasmBuffer = fs.readFileSync(WASM_PATH);
 
@@ -56,14 +62,27 @@ export class WasmBridge {
 			}
 		}
 
-		// seed RNG in wasm (avoid Math.random in hot path)
+		// ✅ seed RNG in wasm (deterministic if provided)
 		if (typeof this.wasmModule.seed_rng === "function") {
-			const seed = (Date.now() ^ (process.pid << 16)) >>> 0;
+			const seedFromEnv = process.env.HNSW_SEED
+				? Number(process.env.HNSW_SEED) >>> 0
+				: 0;
+
+			const seed =
+				config?.seed != null
+					? config.seed >>> 0
+					: seedFromEnv || (Date.now() ^ (process.pid << 16)) >>> 0;
+
 			this.wasmModule.seed_rng(seed);
 		}
 
 		const cap = config?.capacity ?? 10000;
 		this.wasmModule.init_index(cap);
+
+		// ✅ allocate scratch once (size = dim bytes, for Int8 vectors)
+		if (config?.dim) {
+			this.ensureScratchI8(config.dim);
+		}
 
 		console.log(
 			"WASM Initialized. Memory size:",
@@ -71,11 +90,34 @@ export class WasmBridge {
 		);
 	}
 
-	writeVectorI8(vector: Int8Array): number {
-		const ptr = this.wasmModule.alloc(vector.length);
-		const view = new Int8Array(this.memory.buffer, ptr, vector.length);
+	/**
+	 * ✅ Ensure scratch buffer exists with at least `nBytes`
+	 * Uses WASM alloc() ONLY when growing (rare). No per-query alloc.
+	 */
+	private ensureScratchI8(nBytes: number) {
+		if (nBytes <= 0) throw new Error(`Invalid scratch size: ${nBytes}`);
+		if (this.scratchI8Ptr !== 0 && this.scratchI8Cap >= nBytes) return;
+
+		// allocate or grow once
+		const ptr = this.wasmModule.alloc(nBytes);
+		this.scratchI8Ptr = ptr;
+		this.scratchI8Cap = nBytes;
+	}
+
+	/**
+	 * ✅ Write Int8 vector into reusable WASM scratch buffer, return ptr
+	 */
+	private writeVectorI8Reusable(vector: Int8Array): number {
+		this.ensureScratchI8(vector.length);
+
+		// NOTE: memory.buffer can change if WASM grows; always create view fresh
+		const view = new Int8Array(
+			this.memory.buffer,
+			this.scratchI8Ptr,
+			vector.length,
+		);
 		view.set(vector);
-		return ptr;
+		return this.scratchI8Ptr;
 	}
 
 	hasNode(id: number): boolean {
@@ -86,17 +128,17 @@ export class WasmBridge {
 	}
 
 	insert(id: number, vectorI8: Int8Array) {
-		const ptr = this.writeVectorI8(vectorI8);
+		const ptr = this.writeVectorI8Reusable(vectorI8);
 		this.wasmModule.insert(id, ptr);
 	}
 
 	updateVector(id: number, vectorI8: Int8Array) {
-		const ptr = this.writeVectorI8(vectorI8);
+		const ptr = this.writeVectorI8Reusable(vectorI8);
 		this.wasmModule.update_vector(id, ptr);
 	}
 
 	search(vectorI8: Int8Array, k: number) {
-		const ptr = this.writeVectorI8(vectorI8);
+		const ptr = this.writeVectorI8Reusable(vectorI8);
 		const count = this.wasmModule.search(ptr, k);
 		if (count === 0) return [];
 
@@ -133,11 +175,16 @@ export class WasmBridge {
 
 		const buf = await fs.promises.readFile(filePath);
 
+		// reset allocator (bump pointer) -> all old pointers invalid
 		if (typeof this.wasmModule.reset_memory === "function") {
 			this.wasmModule.reset_memory();
 		} else {
 			this.wasmModule.init_memory();
 		}
+
+		// ✅ scratch pointer becomes invalid after reset, force re-ensure later
+		this.scratchI8Ptr = 0;
+		this.scratchI8Cap = 0;
 
 		if (this.currentConfig) {
 			this.wasmModule.set_config(
@@ -153,15 +200,29 @@ export class WasmBridge {
 			}
 		}
 
-		// reseed after reset
+		// ✅ reseed after reset (keep deterministic if env/config provided)
 		if (typeof this.wasmModule.seed_rng === "function") {
-			const seed = (Date.now() ^ (process.pid << 16)) >>> 0;
+			const seedFromEnv = process.env.HNSW_SEED
+				? Number(process.env.HNSW_SEED) >>> 0
+				: 0;
+
+			const seed =
+				this.currentConfig?.seed != null
+					? this.currentConfig.seed >>> 0
+					: seedFromEnv || (Date.now() ^ (process.pid << 16)) >>> 0;
+
 			this.wasmModule.seed_rng(seed);
 		}
 
+		// load dump (this alloc is expected, but it happens once per load)
 		const ptr = this.wasmModule.alloc(buf.length);
 		new Uint8Array(this.memory.buffer, ptr, buf.length).set(buf);
 		this.wasmModule.load_index(ptr, buf.length);
+
+		// ✅ re-create scratch after load (optional; can be lazy too)
+		if (this.currentConfig?.dim) {
+			this.ensureScratchI8(this.currentConfig.dim);
+		}
 
 		console.log(`Index loaded: ${buf.length} bytes`);
 	}

@@ -38,6 +38,9 @@ export interface DBConfig {
 
 	// ✅ vectors 加速：预加载到内存（Windows 随机小读抖动会明显改善）
 	preloadVectors?: boolean;
+
+	// ✅ deterministic benchmark
+	seed?: number;
 }
 
 export class MiniVectorDB {
@@ -251,7 +254,15 @@ export class MiniVectorDB {
 			Number(process.env.HNSW_CAPACITY ?? 0) ||
 			1_200_000;
 
-		await this.wasm.init({ dim, m, ef, efSearch, capacity });
+		// ✅ deterministic seed (config.seed > env > random)
+		const seedFromEnv = process.env.HNSW_SEED
+			? Number(process.env.HNSW_SEED) >>> 0
+			: undefined;
+
+		const seed =
+			this.config.seed != null ? this.config.seed >>> 0 : seedFromEnv;
+
+		await this.wasm.init({ dim, m, ef, efSearch, capacity, seed });
 		await this.meta.ready();
 		await this.ensureVectorStoreReady();
 
@@ -273,13 +284,13 @@ export class MiniVectorDB {
 	}
 
 	async insert(item: InsertItem): Promise<void> {
-		// keep compatibility; route to insertMany
 		await this.insertMany([item]);
 	}
 
 	/**
-	 * ✅ Bulk insert:
-	 * - meta beginBulk/endBulk
+	 * ✅ Bulk insert optimized:
+	 * - one Loki getMany() per batch (instead of per item)
+	 * - one Loki addMany() per batch (instead of per item)
 	 * - contiguous vectors written in one big write for new ids (fast)
 	 * - wasm insert/update still per item
 	 */
@@ -289,15 +300,27 @@ export class MiniVectorDB {
 
 		const expectedDim = this.dim();
 
-		// prepare vectors + quantized
+		// 1) batch lookup existing metadata once
+		const externalIds = items.map((it) => it.id);
+		const existingMap = this.meta.getMany(externalIds);
+
+		// 2) prepare vectors + quantized + internal id assignment
 		const f32s: Float32Array[] = new Array(items.length);
 		const q8s: Int8Array[] = new Array(items.length);
 		const internalIds: number[] = new Array(items.length);
 		const isNew: boolean[] = new Array(items.length);
 
-		// bulk meta write
-		this.meta.beginBulk();
+		const metaEntries: {
+			external_id: string;
+			internal_id: number;
+			metadata: any;
+		}[] = new Array(items.length);
 
+		// allocate new internal ids in a stable way
+		const baseCount = this.meta.count();
+		let newCount = 0;
+
+		this.meta.beginBulk();
 		try {
 			for (let i = 0; i < items.length; i++) {
 				const { id, vector, metadata } = items[i];
@@ -311,31 +334,40 @@ export class MiniVectorDB {
 
 				const q8 = this.quantizeToI8(f32);
 
-				const existing = this.meta.get(id);
+				const existing = existingMap.get(id);
 				if (existing) {
 					internalIds[i] = existing.internal_id;
 					isNew[i] = false;
-					this.meta.add(
-						id,
-						existing.internal_id,
-						metadata ?? existing.metadata,
-					);
+
+					metaEntries[i] = {
+						external_id: id,
+						internal_id: existing.internal_id,
+						metadata: metadata ?? existing.metadata,
+					};
 				} else {
-					const newInternalId = this.meta.items.count();
+					const newInternalId = baseCount + newCount;
+					newCount++;
+
 					internalIds[i] = newInternalId;
 					isNew[i] = true;
-					this.meta.add(id, newInternalId, metadata || {});
+
+					metaEntries[i] = {
+						external_id: id,
+						internal_id: newInternalId,
+						metadata: metadata || {},
+					};
 				}
 
 				f32s[i] = f32;
 				q8s[i] = q8;
 			}
 
-			// fast path: write all NEW ids as contiguous runs in one or few writes
-			// (benchmark inserts doc-0..doc-N sequentially -> this becomes a single write per batch)
+			// 3) single meta write
+			this.meta.addMany(metaEntries, existingMap);
+
+			// 4) fast path: write all NEW ids as contiguous runs
 			{
-				// collect new entries and sort by internalId (stable)
-				const pairs = [];
+				const pairs: { id: number; vec: Float32Array }[] = [];
 				for (let i = 0; i < items.length; i++) {
 					if (isNew[i]) pairs.push({ id: internalIds[i], vec: f32s[i] });
 				}
@@ -358,14 +390,14 @@ export class MiniVectorDB {
 				}
 			}
 
-			// updates: write individually (could also be grouped but less common)
+			// 5) updates: write individually
 			for (let i = 0; i < items.length; i++) {
 				if (!isNew[i]) {
 					await this.writeF32Vector(internalIds[i], f32s[i]);
 				}
 			}
 
-			// wasm graph ops
+			// 6) wasm graph ops
 			for (let i = 0; i < items.length; i++) {
 				const internalId = internalIds[i];
 				const q8 = q8s[i];
@@ -437,7 +469,6 @@ export class MiniVectorDB {
 		}
 		if (candidates.length === 0) return [];
 
-		// ✅ read vectors with cache or merged IO
 		const vecMap = await this.readF32Vectors(candidates);
 
 		const reranked: { internalId: number; score: number }[] = [];
@@ -465,6 +496,46 @@ export class MiniVectorDB {
 		return results;
 	}
 
+	// 在 src/index.ts 的 MiniVectorDB class 里新增
+
+	/**
+	 * ✅ Expose ANN-stage raw results (WASM HNSW on Int8 L2^2) for benchmarking.
+	 * - Returns internal IDs (NOT external ids)
+	 * - Distances are Int8 L2^2 (stored as f32 by wasm, but semantically i32 distance)
+	 */
+	async searchAnnI8(
+		query: number[] | Float32Array | string | Buffer | Uint8Array,
+		annK: number,
+	): Promise<{ internalId: number; dist: number }[]> {
+		if (!this.isReady) await this.init();
+
+		let qF32: Float32Array;
+		if (
+			typeof query === "string" ||
+			query instanceof Buffer ||
+			query instanceof Uint8Array
+		) {
+			qF32 = await this.embedder.embed(query);
+		} else if (query instanceof Float32Array) {
+			qF32 = query;
+		} else {
+			qF32 = new Float32Array(query);
+		}
+
+		const expectedDim = this.dim();
+		if (qF32.length !== expectedDim) {
+			throw new Error(
+				`Query vector dimension mismatch. Expected ${expectedDim}, got ${qF32.length}`,
+			);
+		}
+
+		const qI8 = this.quantizeToI8(qF32);
+		const raw = this.wasm.search(qI8, annK);
+
+		// raw: {id:number, dist:number} where id is internalId
+		return raw.map((r) => ({ internalId: r.id, dist: r.dist }));
+	}
+
 	async save(filepath: string) {
 		await this.wasm.save(filepath);
 		if (this.vecFd) await this.vecFd.sync();
@@ -475,7 +546,6 @@ export class MiniVectorDB {
 		await this.wasm.load(filepath);
 		await this.ensureVectorStoreReady();
 
-		// reload cache (optional)
 		if (this.config.preloadVectors && fs.existsSync(this.vecPath)) {
 			this.vecCache = await fs.promises.readFile(this.vecPath);
 		}

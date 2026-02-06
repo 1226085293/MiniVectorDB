@@ -83,7 +83,7 @@ const timestamp =
 
 const outputFile = `merged_${timestamp}.md`;
 
-fs.writeFileSync(path.join("./temp", outputFile), mdContent, 'utf-8');
+fs.writeFileSync(outputFile, mdContent, 'utf-8');
 
 console.log(`✅ 已生成 Markdown 文件: ${outputFile}`);
 console.log(`📄 共处理 ${collectedFiles.length} 个文件`);
