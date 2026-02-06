@@ -22,6 +22,10 @@ export class WasmBridge {
 	private scratchI8Ptr: number = 0;
 	private scratchI8Cap: number = 0;
 
+	// ✅ reusable dump buffer to avoid alloc-leak on repeated load()
+	private scratchDumpPtr: number = 0;
+	private scratchDumpCap: number = 0;
+
 	private lock: Promise<void> = Promise.resolve();
 
 	private wasmMaxEf: number = 0;
@@ -52,7 +56,7 @@ export class WasmBridge {
 
 		const imports = {
 			env: {
-				abort: (msg: number, file: number, line: number, col: number) => {
+				abort: (_msg: number, _file: number, line: number, col: number) => {
 					console.error(`WASM Abort: ${line}:${col}`);
 				},
 				seed: () => Math.random(),
@@ -110,6 +114,10 @@ export class WasmBridge {
 				this.ensureScratchI8(config.dim);
 			}
 
+			// dump buffer reset (will be allocated on demand)
+			this.scratchDumpPtr = 0;
+			this.scratchDumpCap = 0;
+
 			console.log(
 				"WASM Initialized. Memory size:",
 				this.memory.buffer.byteLength,
@@ -143,6 +151,15 @@ export class WasmBridge {
 		this.scratchI8Cap = nBytes;
 	}
 
+	private ensureScratchDump(nBytes: number) {
+		if (nBytes <= 0) throw new Error(`Invalid dump scratch size: ${nBytes}`);
+		if (this.scratchDumpPtr !== 0 && this.scratchDumpCap >= nBytes) return;
+
+		const ptr = this.wasmModule.alloc(nBytes);
+		this.scratchDumpPtr = ptr;
+		this.scratchDumpCap = nBytes;
+	}
+
 	private writeVectorI8Reusable(vector: Int8Array): number {
 		this.ensureScratchI8(vector.length);
 
@@ -153,6 +170,14 @@ export class WasmBridge {
 		);
 		view.set(vector);
 		return this.scratchI8Ptr;
+	}
+
+	private writeDumpReusable(buf: Buffer): number {
+		this.ensureScratchDump(buf.length);
+		new Uint8Array(this.memory.buffer, this.scratchDumpPtr, buf.length).set(
+			buf,
+		);
+		return this.scratchDumpPtr;
 	}
 
 	async getResultsCap(): Promise<number> {
@@ -177,7 +202,6 @@ export class WasmBridge {
 			if (typeof this.wasmModule.get_max_elements === "function") {
 				return Number(this.wasmModule.get_max_elements());
 			}
-			// fallback to config if wasm export missing
 			return Number(this.currentConfig?.capacity ?? 0);
 		});
 	}
@@ -238,12 +262,22 @@ export class WasmBridge {
 				throw new Error("WASM export get_index_dump_size() not found.");
 			}
 
+			// ✅ avoid bump-allocator leak on repeated save()
+			const mark =
+				typeof this.wasmModule.get_memory_usage === "function"
+					? Number(this.wasmModule.get_memory_usage()) >>> 0
+					: 0;
+
 			const dumpSize: number = this.wasmModule.get_index_dump_size();
 			const ptr: number = this.wasmModule.alloc(dumpSize);
 			const used: number = this.wasmModule.save_index(ptr);
 
 			const view = new Uint8Array(this.memory.buffer, ptr, used);
 			await fs.promises.writeFile(filePath, view);
+
+			if (mark && typeof this.wasmModule.set_memory_usage === "function") {
+				this.wasmModule.set_memory_usage(mark);
+			}
 
 			console.log(`Index saved: ${used} bytes`);
 		});
@@ -255,69 +289,133 @@ export class WasmBridge {
 
 			const buf = await fs.promises.readFile(filePath);
 
-			if (typeof this.wasmModule.reset_memory === "function") {
-				this.wasmModule.reset_memory();
-			} else {
-				this.wasmModule.init_memory();
-			}
-
-			this.scratchI8Ptr = 0;
-			this.scratchI8Cap = 0;
-
-			// refresh max ef (module re-init)
-			if (typeof this.wasmModule.get_max_ef === "function") {
-				this.wasmMaxEf = Number(this.wasmModule.get_max_ef()) | 0;
-			}
-
-			if (this.currentConfig) {
-				this.wasmModule.set_config(
-					this.currentConfig.dim,
-					this.currentConfig.m,
-					this.currentConfig.ef,
-				);
-
-				if (
-					typeof this.wasmModule.set_search_config === "function" &&
-					this.currentConfig.efSearch
-				) {
-					this.wasmModule.set_search_config(this.currentConfig.efSearch);
+			const reinitFresh = () => {
+				if (typeof this.wasmModule.reset_memory === "function") {
+					this.wasmModule.reset_memory();
+				} else {
+					this.wasmModule.init_memory();
 				}
 
-				if (typeof this.wasmModule.set_results_cap === "function") {
-					this.wasmModule.set_results_cap(
-						this.clampResultsCap(this.currentConfig.resultsCap ?? 1000),
+				this.scratchI8Ptr = 0;
+				this.scratchI8Cap = 0;
+				this.scratchDumpPtr = 0;
+				this.scratchDumpCap = 0;
+
+				if (typeof this.wasmModule.get_max_ef === "function") {
+					this.wasmMaxEf = Number(this.wasmModule.get_max_ef()) | 0;
+				}
+
+				if (this.currentConfig) {
+					this.wasmModule.set_config(
+						this.currentConfig.dim,
+						this.currentConfig.m,
+						this.currentConfig.ef,
+					);
+
+					if (
+						typeof this.wasmModule.set_search_config === "function" &&
+						this.currentConfig.efSearch
+					) {
+						this.wasmModule.set_search_config(this.currentConfig.efSearch);
+					}
+
+					if (typeof this.wasmModule.set_results_cap === "function") {
+						this.wasmModule.set_results_cap(
+							this.clampResultsCap(this.currentConfig.resultsCap ?? 1000),
+						);
+					}
+
+					if (typeof this.wasmModule.seed_rng === "function") {
+						const seedFromEnv = process.env.HNSW_SEED
+							? Number(process.env.HNSW_SEED) >>> 0
+							: 0;
+
+						const seed =
+							this.currentConfig.seed != null
+								? this.currentConfig.seed >>> 0
+								: seedFromEnv || (Date.now() ^ (process.pid << 16)) >>> 0;
+
+						this.wasmModule.seed_rng(seed);
+					}
+
+					const cap = this.currentConfig.capacity ?? 0;
+					this.wasmModule.init_index(cap);
+
+					this.ensureScratchI8(this.currentConfig.dim);
+				}
+			};
+
+			try {
+				if (typeof this.wasmModule.reset_memory === "function") {
+					this.wasmModule.reset_memory();
+				} else {
+					this.wasmModule.init_memory();
+				}
+
+				this.scratchI8Ptr = 0;
+				this.scratchI8Cap = 0;
+				this.scratchDumpPtr = 0;
+				this.scratchDumpCap = 0;
+
+				if (typeof this.wasmModule.get_max_ef === "function") {
+					this.wasmMaxEf = Number(this.wasmModule.get_max_ef()) | 0;
+				}
+
+				if (this.currentConfig) {
+					// set_config is allowed to be idempotent after init (same values)
+					this.wasmModule.set_config(
+						this.currentConfig.dim,
+						this.currentConfig.m,
+						this.currentConfig.ef,
+					);
+
+					if (
+						typeof this.wasmModule.set_search_config === "function" &&
+						this.currentConfig.efSearch
+					) {
+						this.wasmModule.set_search_config(this.currentConfig.efSearch);
+					}
+
+					if (typeof this.wasmModule.set_results_cap === "function") {
+						this.wasmModule.set_results_cap(
+							this.clampResultsCap(this.currentConfig.resultsCap ?? 1000),
+						);
+					}
+
+					if (typeof this.wasmModule.seed_rng === "function") {
+						const seedFromEnv = process.env.HNSW_SEED
+							? Number(process.env.HNSW_SEED) >>> 0
+							: 0;
+
+						const seed =
+							this.currentConfig.seed != null
+								? this.currentConfig.seed >>> 0
+								: seedFromEnv || (Date.now() ^ (process.pid << 16)) >>> 0;
+
+						this.wasmModule.seed_rng(seed);
+					}
+				}
+
+				// ✅ reusable dump buffer (no cumulative alloc growth)
+				const ptr = this.writeDumpReusable(buf);
+
+				const ok: number = this.wasmModule.load_index(ptr, buf.length);
+				if (!ok) {
+					throw new Error(
+						"WASM load_index failed (format/config mismatch or corrupt dump).",
 					);
 				}
+
+				if (this.currentConfig?.dim) {
+					this.ensureScratchI8(this.currentConfig.dim);
+				}
+
+				console.log(`Index loaded: ${buf.length} bytes`);
+			} catch (e) {
+				// ✅ keep module usable even if load fails
+				reinitFresh();
+				throw e;
 			}
-
-			if (typeof this.wasmModule.seed_rng === "function") {
-				const seedFromEnv = process.env.HNSW_SEED
-					? Number(process.env.HNSW_SEED) >>> 0
-					: 0;
-
-				const seed =
-					this.currentConfig?.seed != null
-						? this.currentConfig.seed >>> 0
-						: seedFromEnv || (Date.now() ^ (process.pid << 16)) >>> 0;
-
-				this.wasmModule.seed_rng(seed);
-			}
-
-			const ptr = this.wasmModule.alloc(buf.length);
-			new Uint8Array(this.memory.buffer, ptr, buf.length).set(buf);
-
-			const ok: number = this.wasmModule.load_index(ptr, buf.length);
-			if (!ok) {
-				throw new Error(
-					"WASM load_index failed (format/config mismatch or corrupt dump).",
-				);
-			}
-
-			if (this.currentConfig?.dim) {
-				this.ensureScratchI8(this.currentConfig.dim);
-			}
-
-			console.log(`Index loaded: ${buf.length} bytes`);
 		});
 	}
 }

@@ -40,7 +40,6 @@ export interface DBConfig {
 
 	resultsCap?: number;
 
-	// Optional cap for ANN candidates to avoid runaway memory/time
 	maxAnnK?: number;
 }
 
@@ -55,10 +54,8 @@ export class MiniVectorDB {
 	private vecFd: fs.promises.FileHandle | null = null;
 	private vecCache: Buffer | null = null;
 
-	// ✅ align host caps with wasm MAX_EF
 	private wasmMaxEf: number = 0;
 
-	// ✅ Global mutex to avoid meta/file/wasm divergence under concurrency
 	private opLock: Promise<void> = Promise.resolve();
 	private async withLock<T>(fn: () => Promise<T> | T): Promise<T> {
 		let release!: () => void;
@@ -107,12 +104,20 @@ export class MiniVectorDB {
 		const fromEnv = process.env.MAX_ANN_K ? Number(process.env.MAX_ANN_K) : 0;
 		let cap = (fromCfg ?? fromEnv) || 10_000;
 
-		// ✅ align with wasm MAX_EF (otherwise wasted + confusing)
 		if (this.wasmMaxEf > 0) cap = Math.min(cap, this.wasmMaxEf);
 
-		// also reasonable hard floor
 		if (cap <= 0) cap = 1;
 		return cap;
+	}
+
+	// ✅ normalize vectors so: stored F32 == quantized I8 semantics
+	private normalizeF32InPlace(v: Float32Array): Float32Array {
+		let normSq = 0;
+		for (let i = 0; i < v.length; i++) normSq += v[i] * v[i];
+		if (normSq <= 0) return v;
+		const inv = 1 / Math.sqrt(normSq);
+		for (let i = 0; i < v.length; i++) v[i] *= inv;
+		return v;
 	}
 
 	private async ensureVectorStoreReady(): Promise<void> {
@@ -251,7 +256,6 @@ export class MiniVectorDB {
 			const buf = Buffer.allocUnsafe(bytes);
 			const { bytesRead } = await fd.read(buf, 0, bytes, pos);
 
-			// ✅ critical: no silent short-read
 			if (bytesRead !== bytes) {
 				throw new Error(
 					`Vector store short read. pos=${pos} need=${bytes} got=${bytesRead}`,
@@ -307,10 +311,8 @@ export class MiniVectorDB {
 				resultsCap,
 			});
 
-			// ✅ align host caps with wasm MAX_EF
 			this.wasmMaxEf = await this.wasm.getMaxEf();
 
-			// also clamp resultsCap in wasm again (in case env/config > maxEf)
 			if (this.wasmMaxEf > 0) {
 				const clamp = Math.min(resultsCap, this.wasmMaxEf);
 				await this.wasm.setResultsCap(clamp);
@@ -338,10 +340,15 @@ export class MiniVectorDB {
 			vector instanceof Buffer ||
 			vector instanceof Uint8Array
 		) {
-			return await this.embedder.embed(vector);
+			const v = await this.embedder.embed(vector);
+			return this.normalizeF32InPlace(v);
 		}
-		if (vector instanceof Float32Array) return vector;
-		return new Float32Array(vector);
+		if (vector instanceof Float32Array) {
+			const v = new Float32Array(vector); // avoid mutating caller buffer
+			return this.normalizeF32InPlace(v);
+		}
+		const v = new Float32Array(vector);
+		return this.normalizeF32InPlace(v);
 	}
 
 	private ensureWithinCapacity(internalId: number) {
@@ -382,7 +389,6 @@ export class MiniVectorDB {
 			let newItemsCount = 0;
 			for (const it of items) if (!existingMap.get(it.id)) newItemsCount++;
 
-			// ✅ BEGIN BULK (we'll COMMIT only after vectors+wasm succeed)
 			this.meta.beginBulk();
 			let commit = false;
 
@@ -406,7 +412,6 @@ export class MiniVectorDB {
 					metadata: any;
 				}[] = new Array(items.length);
 
-				// 1) resolve vectors + assign internal ids (NO meta write yet)
 				for (let i = 0; i < items.length; i++) {
 					const { id, vector, metadata } = items[i];
 					const f32 = await this.resolveVectorToF32(vector);
@@ -451,7 +456,7 @@ export class MiniVectorDB {
 					q8s[i] = q8;
 				}
 
-				// 2) write vectors (new contiguous runs first)
+				// write new contiguous runs
 				{
 					const pairs: { id: number; vec: Float32Array }[] = [];
 					for (let i = 0; i < items.length; i++)
@@ -482,12 +487,11 @@ export class MiniVectorDB {
 					}
 				}
 
-				// ✅ fsync vectors BEFORE committing meta (crash-consistency)
 				if (this.vecFd) {
 					await this.vecFd.sync();
 				}
 
-				// 3) wasm graph ops
+				// wasm ops
 				for (let i = 0; i < items.length; i++) {
 					const internalId = internalIds[i];
 					const q8 = q8s[i];
@@ -503,12 +507,11 @@ export class MiniVectorDB {
 					}
 				}
 
-				// 4) commit meta LAST
+				// commit meta last
 				this.meta.addMany(metaEntries, existingMap);
 
 				commit = true;
 			} finally {
-				// ✅ commit=true only if fully succeeded; otherwise rollback bulk changes
 				await this.meta.endBulk(commit);
 			}
 		});
@@ -517,7 +520,6 @@ export class MiniVectorDB {
 	private async ensureResultsCapAtLeast(n: number) {
 		if (n <= 0) return;
 
-		// ✅ clamp to wasm MAX_EF
 		if (this.wasmMaxEf > 0) {
 			n = Math.min(n, this.wasmMaxEf);
 		}
@@ -525,7 +527,6 @@ export class MiniVectorDB {
 		const cur = await this.wasm.getResultsCap();
 		if (cur >= n) return;
 
-		// grow (still clamped inside wasm bridge)
 		let next = cur > 0 ? cur : 1000;
 		while (next < n) next = next * 2;
 
@@ -537,7 +538,6 @@ export class MiniVectorDB {
 		k: number = 10,
 		filter?: any,
 	): Promise<SearchResult[]> {
-		// ✅ serialize with writes to avoid reading partially-written vector/meta state
 		return this.withLock(async () => {
 			if (!this.isReady) await this.init();
 
@@ -549,10 +549,12 @@ export class MiniVectorDB {
 			) {
 				qF32 = await this.embedder.embed(query);
 			} else if (query instanceof Float32Array) {
-				qF32 = query;
+				qF32 = new Float32Array(query); // avoid mutating caller buffer
 			} else {
 				qF32 = new Float32Array(query);
 			}
+
+			this.normalizeF32InPlace(qF32);
 
 			const expectedDim = this.dim();
 			if (qF32.length !== expectedDim) {
@@ -566,7 +568,6 @@ export class MiniVectorDB {
 			const mult = this.config.rerankMultiplier ?? 30;
 			let annK = Math.max(k * mult, k);
 
-			// ✅ cap ANN candidates to avoid runaway (and align with wasm MAX_EF)
 			const cap = this.maxAnnK();
 			if (annK > cap) annK = cap;
 
@@ -619,6 +620,9 @@ export class MiniVectorDB {
 
 	async save(filepath: string) {
 		return this.withLock(async () => {
+			// ✅ flush meta so snapshot is consistent
+			await this.meta.saveNow();
+
 			await this.wasm.save(filepath);
 			if (this.vecFd) await this.vecFd.sync();
 		});

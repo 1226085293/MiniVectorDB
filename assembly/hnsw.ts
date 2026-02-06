@@ -434,6 +434,10 @@ function search_layer(
 		ef_clamped_flag = 1;
 	}
 
+	// ✅ entry_node 必须是存在节点
+	if (entry_node < 0 || entry_node >= max_elements) return 0;
+	if (get_node_ptr(entry_node) == 0) return 0;
+
 	visited_next_stamp();
 
 	let cand_cap: i32 = ef * 2 + 32;
@@ -449,10 +453,15 @@ function search_layer(
 	cand_size = cand_push(cand_size, entry_node, dist0);
 	res_size = res_push(res_size, entry_node, dist0);
 
+	// ✅ 当前层 cap
+	let cap_this: i32 = layer == 0 ? M_MAX0 : M;
+
 	while (cand_size > 0) {
 		cand_size = cand_pop(cand_size);
 		let curr_id = tmp_pop_id;
 		let curr_dist = tmp_pop_dist;
+
+		if (curr_id < 0) continue;
 
 		if (res_size >= ef && curr_dist > res_peek_worst(res_size)) break;
 
@@ -466,6 +475,11 @@ function search_layer(
 		}
 
 		let neighbor_count = load<i32>(runner_ptr);
+
+		// ✅ clamp neighbor_count，避免坏数据越界读
+		if (neighbor_count < 0) continue;
+		if (neighbor_count > cap_this) neighbor_count = cap_this;
+
 		let neighbors_start = runner_ptr + 4;
 
 		for (let i = 0; i < neighbor_count; i++) {
@@ -473,6 +487,9 @@ function search_layer(
 
 			if (neighbor_id < 0) continue;
 			if (neighbor_id >= max_elements) continue;
+
+			// ✅ skip non-present nodes (sparse-id / corrupted edges)
+			if (get_node_ptr(neighbor_id) == 0) continue;
 
 			if (visited_get(neighbor_id)) continue;
 			visited_set(neighbor_id);
@@ -737,25 +754,51 @@ export function insert(id: i32, vector_data_offset: usize): void {
 	}
 
 	let curr_obj = entry_point_id;
+	if (curr_obj < 0 || curr_obj >= max_elements) {
+		// defensive
+		entry_point_id = id;
+		max_level = level;
+		element_count++;
+		return;
+	}
+	if (get_node_ptr(curr_obj) == 0) {
+		// defensive
+		entry_point_id = id;
+		max_level = level;
+		element_count++;
+		return;
+	}
+
 	let curr_dist = dist_l2_sq(target_vec_ptr, get_vector_ptr(curr_obj));
 
+	// ✅ upper-layer greedy search (defensive clamp)
 	for (let l = max_level; l > level; l--) {
 		let changed = true;
 		while (changed) {
 			changed = false;
 
 			let c_ptr = get_node_ptr(curr_obj);
+			if (c_ptr == 0) break;
+
 			let r_ptr = c_ptr + 8;
 			for (let k = 0; k < l; k++) {
 				let cap = k == 0 ? M_MAX0 : M;
 				r_ptr += 4 + <usize>cap * 4;
 			}
+
+			let cap_layer: i32 = l == 0 ? M_MAX0 : M;
 			let count = load<i32>(r_ptr);
+
+			if (count < 0) count = 0;
+			if (count > cap_layer) count = cap_layer;
+
 			let n_ptr = r_ptr + 4;
 
 			for (let i = 0; i < count; i++) {
 				let neighbor = load<i32>(n_ptr + <usize>i * 4);
 				if (neighbor < 0 || neighbor >= max_elements) continue;
+				if (get_node_ptr(neighbor) == 0) continue;
+
 				let d = dist_l2_sq(target_vec_ptr, get_vector_ptr(neighbor));
 				if (d < curr_dist) {
 					curr_dist = d;
@@ -812,10 +855,13 @@ export function update_and_reconnect(id: i32, vector_data_offset: usize): void {
 
 	if (entry_point_id == -1) return;
 
-	// --- find entry at upper layers (same as insert) ---
 	let curr_obj = entry_point_id;
+	if (curr_obj < 0 || curr_obj >= max_elements) return;
+	if (get_node_ptr(curr_obj) == 0) return;
+
 	let curr_dist = dist_l2_sq(target_vec_ptr, get_vector_ptr(curr_obj));
 
+	// ✅ upper-layer greedy (defensive clamp)
 	for (let l = max_level; l > level; l--) {
 		let changed = true;
 		while (changed) {
@@ -830,11 +876,17 @@ export function update_and_reconnect(id: i32, vector_data_offset: usize): void {
 				r_ptr += 4 + <usize>cap * 4;
 			}
 
+			let cap_layer: i32 = l == 0 ? M_MAX0 : M;
 			let count = load<i32>(r_ptr);
+			if (count < 0) count = 0;
+			if (count > cap_layer) count = cap_layer;
+
 			let n_ptr = r_ptr + 4;
 			for (let i = 0; i < count; i++) {
 				let neighbor = load<i32>(n_ptr + <usize>i * 4);
 				if (neighbor < 0 || neighbor >= max_elements) continue;
+				if (get_node_ptr(neighbor) == 0) continue;
+
 				let d = dist_l2_sq(target_vec_ptr, get_vector_ptr(neighbor));
 				if (d < curr_dist) {
 					curr_dist = d;
@@ -849,7 +901,7 @@ export function update_and_reconnect(id: i32, vector_data_offset: usize): void {
 	for (let l = (level < max_level ? level : max_level); l >= 0; l--) {
 		let target = l == 0 ? M_MAX0 : M;
 
-		// ✅ FIX: capture old neighbors into dedicated old_ids_ptr (NOT out_ids_ptr)
+		// capture old neighbors
 		let old_cap = layer_cap(l);
 		let old_ids_count: i32 = 0;
 		{
@@ -866,11 +918,9 @@ export function update_and_reconnect(id: i32, vector_data_offset: usize): void {
 			}
 		}
 
-		// compute candidates using construction search
 		let found = search_layer(target_vec_ptr, curr_obj, l, EF_CONSTRUCTION, true, target);
 		let picked = select_neighbors_heuristic(target_vec_ptr, found, target);
 
-		// remove reverse edges from old neighbors that are no longer selected
 		for (let i: i32 = 0; i < old_ids_count; i++) {
 			let oldN = load<i32>(old_ids_ptr + <usize>i * 4);
 			if (oldN < 0 || oldN >= max_elements) continue;
@@ -889,10 +939,8 @@ export function update_and_reconnect(id: i32, vector_data_offset: usize): void {
 			}
 		}
 
-		// overwrite this node's neighbors at this layer
 		overwrite_neighbors(id, l, picked);
 
-		// ensure reverse edges exist for selected neighbors
 		for (let i: i32 = 0; i < picked; i++) {
 			let nid = load<i32>(sel_ids_ptr + <usize>i * 4);
 			if (nid < 0 || nid >= max_elements) continue;
@@ -911,9 +959,13 @@ export function get_results_ptr(): usize {
 
 export function search(query_vec_offset: usize, k: i32): i32 {
 	if (entry_point_id == -1) return 0;
+	if (max_elements <= 0) return 0;
 	if (k <= 0) return 0;
 
 	let curr_obj = entry_point_id;
+	if (curr_obj < 0 || curr_obj >= max_elements) return 0;
+	if (get_node_ptr(curr_obj) == 0) return 0;
+
 	let curr_dist = dist_l2_sq(query_vec_offset, get_vector_ptr(curr_obj));
 
 	for (let l = max_level; l > 0; l--) {
@@ -928,12 +980,19 @@ export function search(query_vec_offset: usize, k: i32): i32 {
 				let cap = kk == 0 ? M_MAX0 : M;
 				r_ptr += 4 + <usize>cap * 4;
 			}
+
+			let cap_layer: i32 = l == 0 ? M_MAX0 : M;
 			let count = load<i32>(r_ptr);
+			if (count < 0) count = 0;
+			if (count > cap_layer) count = cap_layer;
+
 			let n_ptr = r_ptr + 4;
 
 			for (let i = 0; i < count; i++) {
 				let neighbor = load<i32>(n_ptr + <usize>i * 4);
 				if (neighbor < 0 || neighbor >= max_elements) continue;
+				if (get_node_ptr(neighbor) == 0) continue;
+
 				let d = dist_l2_sq(query_vec_offset, get_vector_ptr(neighbor));
 				if (d < curr_dist) {
 					curr_dist = d;
@@ -953,7 +1012,6 @@ export function search(query_vec_offset: usize, k: i32): i32 {
 
 	let found = search_layer(query_vec_offset, curr_obj, 0, ef, false, 0);
 
-	// ✅ clamp to fixed buffer capacity & logical cap
 	let out_count = found < k ? found : k;
 	if (out_count > results_cap) out_count = results_cap;
 	if (out_count > MAX_EF) out_count = MAX_EF;
@@ -1099,8 +1157,20 @@ export function load_index(ptr: usize, size: usize): i32 {
 	) {
 		return 0;
 	}
+
 	if (dump_max_elements <= 0) return 0;
 	if (dump_present < 0) return 0;
+	// ✅ present 不能超过 max_elements
+	if (dump_present > dump_max_elements) return 0;
+
+	// ✅ entry/max_level 合法性
+	if (dump_entry != -1) {
+		if (dump_entry < 0 || dump_entry >= dump_max_elements) return 0;
+	}
+	if (dump_max_level < -1 || dump_max_level >= MAX_LAYERS) return 0;
+
+	// ✅ present>0 时必须有 entry
+	if (dump_present > 0 && dump_entry == -1) return 0;
 
 	// ✅ results_cap persisted but clamped
 	if (dump_results_cap > 0) {
@@ -1149,6 +1219,7 @@ export function load_index(ptr: usize, size: usize): i32 {
 			memory.copy(runner + 4, ptr + off, <usize>cap * 4);
 			off += <usize>cap * 4;
 
+			// ✅ sanitize neighbors (out-of-range -> -1)
 			let neighbors_ptr = runner + 4;
 			for (let i: i32 = 0; i < cap; i++) {
 				let nid = load<i32>(neighbors_ptr + <usize>i * 4);
@@ -1166,6 +1237,7 @@ export function load_index(ptr: usize, size: usize): i32 {
 
 	element_count = loaded_count;
 
+	// ✅ entry 必须存在
 	if (entry_point_id != -1 && get_node_ptr(entry_point_id) == 0) {
 		entry_point_id = -1;
 		max_level = -1;

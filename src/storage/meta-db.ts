@@ -73,10 +73,22 @@ export class MetaDB {
 		});
 	}
 
+	// ✅ force flush metadata to disk (avoid dump/vectors/meta inconsistency)
+	saveNow(): Promise<void> {
+		// If inside bulk, caller should finish bulk first.
+		if (this.bulkDepth > 0) return Promise.resolve();
+
+		return new Promise<void>((resolve, reject) => {
+			this.db.saveDatabase((err) => {
+				if (err) return reject(err);
+				resolve();
+			});
+		});
+	}
+
 	beginBulk(): void {
 		this.bulkDepth++;
 		if (this.bulkDepth === 1) {
-			// best-effort: detect autosave enabled (lokijs doesn't expose cleanly in types)
 			this.autosaveWasEnabled = true;
 			try {
 				// @ts-ignore
@@ -87,8 +99,8 @@ export class MetaDB {
 
 	/**
 	 * ✅ endBulk(commit)
-	 * - commit=true: 保存数据库并恢复 autosave
-	 * - commit=false: 丢弃 bulk 期间的内存变更（通过 reloadDatabase 回滚到磁盘版本）
+	 * - commit=true: save DB and restore autosave
+	 * - commit=false: rollback bulk in-memory changes by reloading from disk
 	 */
 	async endBulk(commit: boolean = true): Promise<void> {
 		if (this.bulkDepth <= 0) return;
@@ -104,7 +116,6 @@ export class MetaDB {
 				});
 			});
 		} else {
-			// ✅ rollback: reload from disk
 			await new Promise<void>((resolve, reject) => {
 				this.db.loadDatabase({}, (err) => {
 					if (err) return reject(err);
@@ -229,7 +240,7 @@ export class MetaDB {
 		return set;
 	}
 
-	// ✅ 关键修复：关闭前禁用 autosave，避免 interval 残留导致进程不退出
+	// ✅ critical: disable autosave before close to avoid hanging intervals
 	close(): Promise<void> {
 		try {
 			// @ts-ignore
