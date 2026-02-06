@@ -1,3 +1,4 @@
+// assembly/index.ts
 // Entry point for the WASM module
 
 import {
@@ -16,6 +17,7 @@ import {
 	set_state_ptr,
 	save_index,
 	load_index,
+	get_index_dump_size,
 } from "./hnsw";
 import { dist_l2_sq, dist_dot } from "./math";
 import { update_config } from "./config";
@@ -35,6 +37,7 @@ export {
 	set_state_ptr,
 	save_index,
 	load_index,
+	get_index_dump_size,
 };
 export { dist_l2_sq, dist_dot };
 

@@ -1,8 +1,9 @@
+// assembly/hnsw.ts
 import { dist_l2_sq } from "./math";
 import { alloc } from "./memory";
-import { M, M_MAX0, EF_CONSTRUCTION, MAX_LAYERS } from "./config";
+import { M, M_MAX0, EF_CONSTRUCTION, MAX_LAYERS, DIM } from "./config";
 import { get_node_size, get_vector_size } from "./types";
-import { CandidateList, Candidate } from "./pqueue";
+import { CandidateList } from "./pqueue";
 
 // --- GLOBALS ---
 let entry_point_id: i32 = -1;
@@ -33,6 +34,11 @@ export function init_index(capacity: i32): void {
 	entry_point_id = -1;
 	max_level = -1;
 	element_count = 0;
+
+	// Optional: clear offsets to avoid stale pointers
+	for (let i: i32 = 0; i < capacity; i++) {
+		store<usize>(node_offsets_ptr + <usize>i * 4, 0);
+	}
 }
 
 function get_random_level(): i32 {
@@ -53,8 +59,8 @@ function search_layer(
 	ef: i32,
 ): CandidateList {
 	let visited = new Set<i32>();
-	let candidates = new CandidateList(ef); // Candidates to explore (Min-Heap behavior ideally, here sorted list)
-	let results = new CandidateList(ef); // Best results found so far (Max-Heap behavior ideally)
+	let candidates = new CandidateList(ef);
+	let results = new CandidateList(ef);
 
 	let dist = dist_l2_sq(query_vec_ptr, get_vector_ptr(entry_node));
 
@@ -63,11 +69,9 @@ function search_layer(
 	results.push(entry_node, dist);
 
 	while (!candidates.isEmpty()) {
-		let curr = candidates.popClosest(); // Get closest candidate
+		let curr = candidates.popClosest();
 		if (curr == null) break;
 
-		// Optimization: if closest candidate is worse than worst result, stop?
-		// Standard HNSW condition: dist > lowerBound (worst result distance)
 		if (curr.distance > results.worstDist()) {
 			break;
 		}
@@ -91,7 +95,6 @@ function search_layer(
 				visited.add(neighbor_id);
 				let d = dist_l2_sq(query_vec_ptr, get_vector_ptr(neighbor_id));
 
-				// Add to results if it fits or is better than worst
 				if (d < results.worstDist() || results.size() < ef) {
 					candidates.push(neighbor_id, d);
 					results.push(neighbor_id, d);
@@ -118,23 +121,19 @@ function add_connection(src: i32, dst: i32, layer: i32): void {
 	let neighbors_ptr = runner + 4;
 
 	// Check if already connected (avoid duplicate)
-	// Linear scan is ok for small M
 	for (let i = 0; i < count; i++) {
 		if (load<i32>(neighbors_ptr + <usize>i * 4) == dst) return;
 	}
 
 	if (count < M_cur) {
-		// Just add
 		store<i32>(neighbors_ptr + <usize>count * 4, dst);
 		store<i32>(runner, count + 1);
 	} else {
-		// Full: Select Neighbors (Shrink)
-		// Simple strategy: Find worst neighbor, if dst is better, replace.
+		// Full: simple pruning strategy
 		let src_vec = get_vector_ptr(src);
 		let worst_idx = -1;
 		let worst_dist: f32 = -1.0;
 
-		// Find worst in existing
 		for (let i = 0; i < count; i++) {
 			let n_id = load<i32>(neighbors_ptr + <usize>i * 4);
 			let d = dist_l2_sq(src_vec, get_vector_ptr(n_id));
@@ -146,7 +145,6 @@ function add_connection(src: i32, dst: i32, layer: i32): void {
 
 		let dst_dist = dist_l2_sq(src_vec, get_vector_ptr(dst));
 		if (dst_dist < worst_dist) {
-			// Replace
 			store<i32>(neighbors_ptr + <usize>worst_idx * 4, dst);
 		}
 	}
@@ -165,7 +163,7 @@ export function insert(id: i32, vector_data_offset: usize): void {
 	let node_ptr = alloc(node_sz);
 	store<i32>(node_ptr, id);
 	store<i32>(node_ptr + 4, level);
-	// Init counts
+
 	let runner = node_ptr + 8;
 	for (let l = 0; l <= level; l++) {
 		store<i32>(runner, 0);
@@ -190,7 +188,7 @@ export function insert(id: i32, vector_data_offset: usize): void {
 		let changed = true;
 		while (changed) {
 			changed = false;
-			// Search immediate neighbors of curr_obj at layer l
+
 			let c_ptr = get_node_ptr(curr_obj);
 			let r_ptr = c_ptr + 8;
 			for (let k = 0; k < l; k++) {
@@ -215,11 +213,9 @@ export function insert(id: i32, vector_data_offset: usize): void {
 
 	// Phase 2: From level down to 0, search and connect
 	for (let l = level < max_level ? level : max_level; l >= 0; l--) {
-		// Use search_layer to find EF neighbors
 		let candidates = search_layer(target_vec_ptr, curr_obj, l, EF_CONSTRUCTION);
-		// Select neighbors (heuristic: just top M from candidates)
+
 		let selected_count = 0;
-		// Candidates are closest first. Take top M.
 		for (let i = 0; i < candidates.size(); i++) {
 			let cand = candidates.elements[i];
 			add_connection(id, cand.id, l);
@@ -227,7 +223,7 @@ export function insert(id: i32, vector_data_offset: usize): void {
 			selected_count++;
 			if (selected_count >= M) break;
 		}
-		// Update curr_obj for next layer to be the closest found here
+
 		if (candidates.size() > 0) {
 			let best = candidates.popClosest();
 			if (best) curr_obj = best.id;
@@ -258,9 +254,9 @@ export function search(query_vec_offset: usize, k: i32): i32 {
 			changed = false;
 			let c_ptr = get_node_ptr(curr_obj);
 			let r_ptr = c_ptr + 8;
-			for (let k = 0; k < l; k++) {
+			for (let k2 = 0; k2 < l; k2++) {
 				let cnt = load<i32>(r_ptr);
-				let cap = k == 0 ? M_MAX0 : M;
+				let cap = k2 == 0 ? M_MAX0 : M;
 				r_ptr += 4 + <usize>cap * 4;
 			}
 			let count = load<i32>(r_ptr);
@@ -281,8 +277,6 @@ export function search(query_vec_offset: usize, k: i32): i32 {
 	let ef = k > 50 ? k : 50;
 	let results = search_layer(query_vec_offset, curr_obj, 0, ef);
 
-	// Write results to buffer
-	// Results in CandidateList are closest-first. We want top K.
 	let count = results.size();
 	let out_count = count < k ? count : k;
 
@@ -295,16 +289,8 @@ export function search(query_vec_offset: usize, k: i32): i32 {
 	return out_count;
 }
 
-// --- WASM 状态持久化 ---
+// --- WASM 状态持久化（仍保留，兼容你原接口） ---
 export function get_state_ptr(): usize {
-	// Layout:
-	// [0] entry_point_id
-	// [1] max_level
-	// [2] element_count
-	// [3] node_offsets_ptr
-	// [4] vector_storage_ptr
-	// [5] results_buffer_ptr
-	// [6] max_elements
 	let ptr = alloc(7 * 4);
 	store<i32>(ptr + 0, entry_point_id);
 	store<i32>(ptr + 4, max_level);
@@ -326,49 +312,193 @@ export function set_state_ptr(ptr: usize): void {
 	max_elements = load<i32>(ptr + 24);
 }
 
-// 保存已用节点 + 全局状态
-export function save_index(ptr: usize): usize {
-	// ptr 指向外部 buffer, 返回写入字节数
-	// 布局:
-	// [0..3] element_count i32
-	// [4..31] statePtr 7 * i32 (id, max_level, ...)
-	// [32..] 节点数据按 element_count 序列化
-	store<i32>(ptr, element_count);
-	store<i32>(ptr + 4, entry_point_id);
-	store<i32>(ptr + 8, max_level);
-	store<i32>(ptr + 12, node_offsets_ptr as i32);
-	store<i32>(ptr + 16, vector_storage_ptr as i32);
-	store<i32>(ptr + 20, results_buffer_ptr as i32);
-	store<i32>(ptr + 24, max_elements);
-	store<i32>(ptr + 28, 0); // 备用
+/* ------------------------------
+   ✅ 正确的序列化（Dump V1）
+   不保存任何旧指针地址
+--------------------------------*/
 
-	let offset = 32;
-	for (let i = 0; i < element_count; i++) {
+// 4-byte magic: 'H''N''S''W'
+const MAGIC_HNSW: i32 = 0x57534e48; // little-endian "HNSW"
+const DUMP_VERSION: i32 = 1;
+
+export function get_index_dump_size(): usize {
+	// Header: 10 * i32 = 40 bytes
+	let size: usize = 40;
+
+	// Vectors: element_count * dim * 4
+	size += <usize>element_count * get_vector_size();
+
+	// Nodes
+	for (let i: i32 = 0; i < element_count; i++) {
 		let node_ptr = get_node_ptr(i);
-		let node_size = load<i32>(node_ptr + 4) + 8; // 简化示例
-		memory.copy(ptr + <usize>offset, node_ptr, <usize>node_size);
-		offset += node_size;
+		let level = load<i32>(node_ptr + 4);
+
+		size += 8; // id + level
+
+		for (let l: i32 = 0; l <= level; l++) {
+			let cap = l == 0 ? M_MAX0 : M;
+			size += 4; // count
+			size += <usize>cap * 4; // neighbor slots (full capacity)
+		}
+	}
+	return size;
+}
+
+export function save_index(ptr: usize): usize {
+	let off: usize = 0;
+
+	// Header
+	store<i32>(ptr + off, MAGIC_HNSW);
+	off += 4;
+	store<i32>(ptr + off, DUMP_VERSION);
+	off += 4;
+
+	store<i32>(ptr + off, DIM);
+	off += 4;
+	store<i32>(ptr + off, M);
+	off += 4;
+	store<i32>(ptr + off, EF_CONSTRUCTION);
+	off += 4;
+	store<i32>(ptr + off, MAX_LAYERS);
+	off += 4;
+
+	store<i32>(ptr + off, max_elements);
+	off += 4;
+	store<i32>(ptr + off, element_count);
+	off += 4;
+	store<i32>(ptr + off, entry_point_id);
+	off += 4;
+	store<i32>(ptr + off, max_level);
+	off += 4;
+
+	// Vectors block
+	let vec_bytes: usize = <usize>element_count * get_vector_size();
+	memory.copy(ptr + off, vector_storage_ptr, vec_bytes);
+	off += vec_bytes;
+
+	// Nodes
+	for (let i: i32 = 0; i < element_count; i++) {
+		let node_ptr = get_node_ptr(i);
+		let id = load<i32>(node_ptr + 0);
+		let level = load<i32>(node_ptr + 4);
+
+		store<i32>(ptr + off, id);
+		off += 4;
+		store<i32>(ptr + off, level);
+		off += 4;
+
+		let runner = node_ptr + 8;
+		for (let l: i32 = 0; l <= level; l++) {
+			let cap = l == 0 ? M_MAX0 : M;
+
+			let count = load<i32>(runner);
+			store<i32>(ptr + off, count);
+			off += 4;
+
+			// copy full capacity slots
+			memory.copy(ptr + off, runner + 4, <usize>cap * 4);
+			off += <usize>cap * 4;
+
+			runner += 4 + <usize>cap * 4;
+		}
 	}
 
-	return offset; // 总字节数
+	return off;
 }
 
 export function load_index(ptr: usize, size: usize): void {
-	// 先读取全局状态
-	element_count = load<i32>(ptr);
-	entry_point_id = load<i32>(ptr + 4);
-	max_level = load<i32>(ptr + 8);
-	node_offsets_ptr = load<i32>(ptr + 12);
-	vector_storage_ptr = load<i32>(ptr + 16);
-	results_buffer_ptr = load<i32>(ptr + 20);
-	max_elements = load<i32>(ptr + 24);
+	let off: usize = 0;
 
-	// 节点恢复
-	let offset: usize = 32;
-	for (let i = 0; i < element_count; i++) {
-		let node_ptr = get_node_ptr(i);
-		let node_size = load<i32>(node_ptr + 4) + 8;
-		memory.copy(node_ptr, ptr + <usize>offset, <usize>node_size);
-		offset += node_size;
+	let magic = load<i32>(ptr + off);
+	off += 4;
+	if (magic != MAGIC_HNSW) {
+		// invalid dump
+		entry_point_id = -1;
+		max_level = -1;
+		element_count = 0;
+		return;
+	}
+
+	let ver = load<i32>(ptr + off);
+	off += 4;
+	if (ver != DUMP_VERSION) {
+		entry_point_id = -1;
+		max_level = -1;
+		element_count = 0;
+		return;
+	}
+
+	let dump_dim = load<i32>(ptr + off);
+	off += 4;
+	let dump_m = load<i32>(ptr + off);
+	off += 4;
+	let dump_ef = load<i32>(ptr + off);
+	off += 4;
+	let dump_layers = load<i32>(ptr + off);
+	off += 4;
+
+	let dump_max_elements = load<i32>(ptr + off);
+	off += 4;
+	let dump_element_count = load<i32>(ptr + off);
+	off += 4;
+	let dump_entry = load<i32>(ptr + off);
+	off += 4;
+	let dump_max_level = load<i32>(ptr + off);
+	off += 4;
+
+	// Strict config match to avoid layout mismatch & OOB
+	if (
+		dump_dim != DIM ||
+		dump_m != M ||
+		dump_ef != EF_CONSTRUCTION ||
+		dump_layers != MAX_LAYERS
+	) {
+		entry_point_id = -1;
+		max_level = -1;
+		element_count = 0;
+		return;
+	}
+
+	// Re-init fresh memory regions for index
+	init_index(dump_max_elements);
+
+	element_count = dump_element_count;
+	entry_point_id = dump_entry;
+	max_level = dump_max_level;
+
+	// Vectors
+	let vec_bytes: usize = <usize>element_count * get_vector_size();
+	memory.copy(vector_storage_ptr, ptr + off, vec_bytes);
+	off += vec_bytes;
+
+	// Nodes
+	for (let i: i32 = 0; i < element_count; i++) {
+		let id = load<i32>(ptr + off);
+		off += 4;
+		let level = load<i32>(ptr + off);
+		off += 4;
+
+		let node_sz = get_node_size(level);
+		let node_ptr = alloc(node_sz);
+
+		store<i32>(node_ptr + 0, id);
+		store<i32>(node_ptr + 4, level);
+
+		let runner = node_ptr + 8;
+		for (let l: i32 = 0; l <= level; l++) {
+			let cap = l == 0 ? M_MAX0 : M;
+
+			let count = load<i32>(ptr + off);
+			off += 4;
+			store<i32>(runner, count);
+
+			memory.copy(runner + 4, ptr + off, <usize>cap * 4);
+			off += <usize>cap * 4;
+
+			runner += 4 + <usize>cap * 4;
+		}
+
+		// internal id -> node ptr
+		store<usize>(node_offsets_ptr + <usize>i * 4, node_ptr);
 	}
 }
