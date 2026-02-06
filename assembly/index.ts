@@ -1,3 +1,4 @@
+// assembly/index.ts
 import {
 	init_memory,
 	alloc,
@@ -12,11 +13,13 @@ import {
 	update_vector,
 	search,
 	get_results_ptr,
+	get_results_cap,
 	save_index,
 	load_index,
 	get_index_dump_size,
 	has_node,
 	seed_rng,
+	set_results_cap,
 } from "./hnsw";
 
 import { dist_l2_sq, dist_dot } from "./math";
@@ -33,6 +36,8 @@ export function set_search_config(ef_search: i32): void {
 export { init_memory, alloc, get_memory_usage, set_memory_usage, reset_memory };
 
 export {
+	set_results_cap,
+	get_results_cap,
 	init_index,
 	insert,
 	update_vector,
@@ -40,7 +45,7 @@ export {
 	search,
 	get_results_ptr,
 	save_index,
-	load_index,
+	load_index, // now returns i32
 	get_index_dump_size,
 	seed_rng,
 };

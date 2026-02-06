@@ -33,14 +33,13 @@ export interface DBConfig {
 
 	rerankMultiplier?: number;
 
-	// ✅ WASM HNSW capacity
 	capacity?: number;
-
-	// ✅ vectors 加速：预加载到内存（Windows 随机小读抖动会明显改善）
 	preloadVectors?: boolean;
 
-	// ✅ deterministic benchmark
 	seed?: number;
+
+	// ✅ new: results cap for wasm output buffer
+	resultsCap?: number;
 }
 
 export class MiniVectorDB {
@@ -52,8 +51,6 @@ export class MiniVectorDB {
 
 	private vecPath: string;
 	private vecFd: fs.promises.FileHandle | null = null;
-
-	// optional in-memory cache for vectors.f32.bin
 	private vecCache: Buffer | null = null;
 
 	constructor(config: DBConfig = {}) {
@@ -86,7 +83,6 @@ export class MiniVectorDB {
 		const exists = fs.existsSync(this.vecPath);
 		this.vecFd = await fs.promises.open(this.vecPath, exists ? "r+" : "w+");
 
-		// preload cache if configured and file exists
 		if (this.config.preloadVectors && exists) {
 			this.vecCache = await fs.promises.readFile(this.vecPath);
 		}
@@ -155,7 +151,6 @@ export class MiniVectorDB {
 			);
 		}
 
-		// update cache
 		if (this.config.preloadVectors) {
 			this.ensureCacheCapacity(pos + totalBytes);
 			this.vecCache!.set(buf, pos);
@@ -180,7 +175,6 @@ export class MiniVectorDB {
 		const out = new Map<number, Float32Array>();
 		if (internalIds.length === 0) return out;
 
-		// if cache enabled, serve from memory
 		if (this.config.preloadVectors && this.vecCache) {
 			for (const id of internalIds) {
 				const pos = id * bpv;
@@ -197,7 +191,6 @@ export class MiniVectorDB {
 			return out;
 		}
 
-		// otherwise: reduce random IO by merging contiguous runs
 		const ids = Array.from(new Set(internalIds)).sort((a, b) => a - b);
 
 		let i = 0;
@@ -205,7 +198,6 @@ export class MiniVectorDB {
 			const start = ids[i];
 			let end = start;
 
-			// grow contiguous run
 			while (i + 1 < ids.length && ids[i + 1] === end + 1) {
 				i++;
 				end = ids[i];
@@ -216,10 +208,7 @@ export class MiniVectorDB {
 			const bytes = count * bpv;
 
 			const buf = Buffer.allocUnsafe(bytes);
-			const { bytesRead } = await fd.read(buf, 0, bytes, pos);
-			if (bytesRead !== bytes) {
-				// partial read: still try to decode what we got
-			}
+			await fd.read(buf, 0, bytes, pos);
 
 			for (let j = 0; j < count; j++) {
 				const id = start + j;
@@ -245,7 +234,6 @@ export class MiniVectorDB {
 		const m = this.config.m || Number(process.env.HNSW_M ?? 0) || 16;
 		const ef =
 			this.config.ef_construction || Number(process.env.HNSW_EF ?? 0) || 100;
-
 		const efSearch =
 			this.config.ef_search || Number(process.env.HNSW_EF_SEARCH ?? 0) || 50;
 
@@ -254,15 +242,17 @@ export class MiniVectorDB {
 			Number(process.env.HNSW_CAPACITY ?? 0) ||
 			1_200_000;
 
-		// ✅ deterministic seed (config.seed > env > random)
 		const seedFromEnv = process.env.HNSW_SEED
 			? Number(process.env.HNSW_SEED) >>> 0
 			: undefined;
-
 		const seed =
 			this.config.seed != null ? this.config.seed >>> 0 : seedFromEnv;
 
-		await this.wasm.init({ dim, m, ef, efSearch, capacity, seed });
+		const resultsCap =
+			(this.config.resultsCap ?? Number(process.env.HNSW_RESULTS_CAP ?? 0)) ||
+			1000;
+
+		await this.wasm.init({ dim, m, ef, efSearch, capacity, seed, resultsCap });
 		await this.meta.ready();
 		await this.ensureVectorStoreReady();
 
@@ -288,11 +278,7 @@ export class MiniVectorDB {
 	}
 
 	/**
-	 * ✅ Bulk insert optimized:
-	 * - one Loki getMany() per batch (instead of per item)
-	 * - one Loki addMany() per batch (instead of per item)
-	 * - contiguous vectors written in one big write for new ids (fast)
-	 * - wasm insert/update still per item
+	 * ✅ Bulk insert optimized + safe internal_id allocation
 	 */
 	async insertMany(items: InsertItem[]): Promise<void> {
 		if (!this.isReady) await this.init();
@@ -300,11 +286,17 @@ export class MiniVectorDB {
 
 		const expectedDim = this.dim();
 
-		// 1) batch lookup existing metadata once
 		const externalIds = items.map((it) => it.id);
 		const existingMap = this.meta.getMany(externalIds);
 
-		// 2) prepare vectors + quantized + internal id assignment
+		// count new items first to allocate consecutive internal ids safely
+		let newItemsCount = 0;
+		for (const it of items) if (!existingMap.get(it.id)) newItemsCount++;
+
+		const newStartId =
+			newItemsCount > 0 ? this.meta.allocInternalIds(newItemsCount) : 0;
+		let newCursor = 0;
+
 		const f32s: Float32Array[] = new Array(items.length);
 		const q8s: Int8Array[] = new Array(items.length);
 		const internalIds: number[] = new Array(items.length);
@@ -315,10 +307,6 @@ export class MiniVectorDB {
 			internal_id: number;
 			metadata: any;
 		}[] = new Array(items.length);
-
-		// allocate new internal ids in a stable way
-		const baseCount = this.meta.count();
-		let newCount = 0;
 
 		this.meta.beginBulk();
 		try {
@@ -345,8 +333,8 @@ export class MiniVectorDB {
 						metadata: metadata ?? existing.metadata,
 					};
 				} else {
-					const newInternalId = baseCount + newCount;
-					newCount++;
+					const newInternalId = newStartId + newCursor;
+					newCursor++;
 
 					internalIds[i] = newInternalId;
 					isNew[i] = true;
@@ -365,12 +353,11 @@ export class MiniVectorDB {
 			// 3) single meta write
 			this.meta.addMany(metaEntries, existingMap);
 
-			// 4) fast path: write all NEW ids as contiguous runs
+			// 4) write all NEW ids as contiguous runs
 			{
 				const pairs: { id: number; vec: Float32Array }[] = [];
-				for (let i = 0; i < items.length; i++) {
+				for (let i = 0; i < items.length; i++)
 					if (isNew[i]) pairs.push({ id: internalIds[i], vec: f32s[i] });
-				}
 				pairs.sort((a, b) => a.id - b.id);
 
 				let p = 0;
@@ -397,15 +384,15 @@ export class MiniVectorDB {
 				}
 			}
 
-			// 6) wasm graph ops
+			// 6) wasm graph ops (async + locked inside bridge)
 			for (let i = 0; i < items.length; i++) {
 				const internalId = internalIds[i];
 				const q8 = q8s[i];
 
-				if (this.wasm.hasNode(internalId)) {
-					this.wasm.updateVector(internalId, q8);
+				if (await this.wasm.hasNode(internalId)) {
+					await this.wasm.updateVector(internalId, q8);
 				} else {
-					this.wasm.insert(internalId, q8);
+					await this.wasm.insert(internalId, q8);
 				}
 			}
 		} finally {
@@ -445,7 +432,7 @@ export class MiniVectorDB {
 		const mult = this.config.rerankMultiplier ?? 30;
 		const annK = Math.max(k * mult, k);
 
-		const raw = this.wasm.search(qI8, annK);
+		const raw = await this.wasm.search(qI8, annK);
 		if (raw.length === 0) return [];
 
 		const candidates: number[] = [];
@@ -496,12 +483,8 @@ export class MiniVectorDB {
 		return results;
 	}
 
-	// 在 src/index.ts 的 MiniVectorDB class 里新增
-
 	/**
 	 * ✅ Expose ANN-stage raw results (WASM HNSW on Int8 L2^2) for benchmarking.
-	 * - Returns internal IDs (NOT external ids)
-	 * - Distances are Int8 L2^2 (stored as f32 by wasm, but semantically i32 distance)
 	 */
 	async searchAnnI8(
 		query: number[] | Float32Array | string | Buffer | Uint8Array,
@@ -530,9 +513,8 @@ export class MiniVectorDB {
 		}
 
 		const qI8 = this.quantizeToI8(qF32);
-		const raw = this.wasm.search(qI8, annK);
+		const raw = await this.wasm.search(qI8, annK);
 
-		// raw: {id:number, dist:number} where id is internalId
 		return raw.map((r) => ({ internalId: r.id, dist: r.dist }));
 	}
 
@@ -553,7 +535,6 @@ export class MiniVectorDB {
 
 	getStats() {
 		return {
-			memory: (this.wasm as any)["memory"]?.buffer?.byteLength,
 			items: this.meta.items.count(),
 			vectorStore: this.vecPath,
 			capacity: this.config.capacity,
