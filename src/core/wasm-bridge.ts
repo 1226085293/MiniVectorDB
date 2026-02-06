@@ -1,3 +1,4 @@
+// src/core/wasm-bridge.ts
 import fs from "fs";
 import loader from "@assemblyscript/loader";
 import path from "path";
@@ -9,11 +10,21 @@ export class WasmBridge {
 	private memory!: WebAssembly.Memory;
 	private instance!: WebAssembly.Instance;
 
-	private currentConfig: { dim: number; m: number; ef: number } | null = null;
+	private currentConfig: {
+		dim: number;
+		m: number;
+		ef: number;
+		efSearch?: number;
+	} | null = null;
 
 	constructor() {}
 
-	async init(config?: { dim: number; m: number; ef: number }) {
+	async init(config?: {
+		dim: number;
+		m: number;
+		ef: number;
+		efSearch?: number;
+	}) {
 		const wasmBuffer = fs.readFileSync(WASM_PATH);
 
 		const imports = {
@@ -30,46 +41,62 @@ export class WasmBridge {
 		this.instance = result.instance;
 		this.memory = this.wasmModule.memory as WebAssembly.Memory;
 
-		// Initialize allocator
 		this.wasmModule.init_memory();
 
-		// Apply config (must be before init_index / load_index if your AS checks config)
 		if (config) {
 			this.currentConfig = config;
 			this.wasmModule.set_config(config.dim, config.m, config.ef);
+			if (
+				typeof this.wasmModule.set_search_config === "function" &&
+				config.efSearch
+			) {
+				this.wasmModule.set_search_config(config.efSearch);
+			}
 		}
 
-		// Initialize an empty index by default (load_index will re-init internally)
 		this.wasmModule.init_index(10000);
-
 		console.log(
 			"WASM Initialized. Memory size:",
 			this.memory.buffer.byteLength,
 		);
 	}
 
-	// Write Float32 vector into WASM linear memory and return ptr
-	writeVector(vector: Float32Array): number {
-		const ptr = this.wasmModule.alloc(vector.length * 4);
-		const view = new Float32Array(this.memory.buffer, ptr, vector.length);
+	writeVectorI8(vector: Int8Array): number {
+		const ptr = this.wasmModule.alloc(vector.length);
+		const view = new Int8Array(this.memory.buffer, ptr, vector.length);
 		view.set(vector);
 		return ptr;
 	}
 
-	insert(id: number, vector: Float32Array) {
-		const ptr = this.writeVector(vector);
+	/**
+	 * ✅ 兼容：旧 wasm 可能还没导出 has_node（比如你忘了重新 build wasm）
+	 * - 若存在 has_node：精确判断
+	 * - 若不存在：保守返回 false（会走 insert，至少不再报错）
+	 */
+	hasNode(id: number): boolean {
+		if (typeof this.wasmModule.has_node === "function") {
+			return !!this.wasmModule.has_node(id);
+		}
+		return false;
+	}
+
+	insert(id: number, vectorI8: Int8Array) {
+		const ptr = this.writeVectorI8(vectorI8);
 		this.wasmModule.insert(id, ptr);
 	}
 
-	search(vector: Float32Array, k: number) {
-		const ptr = this.writeVector(vector);
+	updateVector(id: number, vectorI8: Int8Array) {
+		const ptr = this.writeVectorI8(vectorI8);
+		this.wasmModule.update_vector(id, ptr);
+	}
+
+	search(vectorI8: Int8Array, k: number) {
+		const ptr = this.writeVectorI8(vectorI8);
 		const count = this.wasmModule.search(ptr, k);
 		if (count === 0) return [];
 
 		const resultsPtr = this.wasmModule.get_results_ptr();
 		const results: { id: number; dist: number }[] = [];
-
-		// Each result: [i32 id, f32 dist] => 8 bytes
 		const view = new DataView(this.memory.buffer, resultsPtr, count * 8);
 
 		for (let i = 0; i < count; i++) {
@@ -81,12 +108,9 @@ export class WasmBridge {
 		return results;
 	}
 
-	// Correct save: allocate exact dump size, save_index returns used bytes
 	async save(filePath: string) {
 		if (typeof this.wasmModule.get_index_dump_size !== "function") {
-			throw new Error(
-				"WASM export get_index_dump_size() not found. Did you update assembly/hnsw.ts?",
-			);
+			throw new Error("WASM export get_index_dump_size() not found.");
 		}
 
 		const dumpSize: number = this.wasmModule.get_index_dump_size();
@@ -99,37 +123,33 @@ export class WasmBridge {
 		console.log(`Index saved: ${used} bytes`);
 	}
 
-	// Correct load:
-	// - reset_memory() to reclaim previous allocations (WASM cannot shrink; this is the clean way)
-	// - re-apply config (if your loader validates dump config against current config)
-	// - load_index() will re-init_index internally and rebuild pointers
 	async load(filePath: string) {
 		if (!fs.existsSync(filePath)) return;
 
 		const buf = await fs.promises.readFile(filePath);
 
-		// Reclaim old allocations to avoid growth across repeated loads
 		if (typeof this.wasmModule.reset_memory === "function") {
 			this.wasmModule.reset_memory();
 		} else {
-			// Fallback: at least re-init allocator base
 			this.wasmModule.init_memory();
 		}
 
-		// Ensure config is applied before load (important if AS validates dump config)
 		if (this.currentConfig) {
 			this.wasmModule.set_config(
 				this.currentConfig.dim,
 				this.currentConfig.m,
 				this.currentConfig.ef,
 			);
+			if (
+				typeof this.wasmModule.set_search_config === "function" &&
+				this.currentConfig.efSearch
+			) {
+				this.wasmModule.set_search_config(this.currentConfig.efSearch);
+			}
 		}
 
-		// Copy dump into WASM memory
 		const ptr = this.wasmModule.alloc(buf.length);
 		new Uint8Array(this.memory.buffer, ptr, buf.length).set(buf);
-
-		// Load dump
 		this.wasmModule.load_index(ptr, buf.length);
 
 		console.log(`Index loaded: ${buf.length} bytes`);

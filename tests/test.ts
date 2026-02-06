@@ -1,3 +1,4 @@
+// tests/test.ts
 import { spawnSync } from "child_process";
 import path from "path";
 
@@ -24,16 +25,27 @@ async function main() {
 		const isWin = process.platform === "win32";
 		const npx = isWin ? "npx.cmd" : "npx";
 
+		// ✅ 屏蔽子脚本输出：不要 inherit，改为 pipe
 		const result = spawnSync(npx, ["ts-node", testPath], {
-			stdio: "inherit",
+			stdio: ["ignore", "pipe", "pipe"],
 			shell: true,
+			encoding: "utf-8",
 		});
 
 		if (result.status === 0) {
-			console.log(`\n[PASSED]: ${testFile}\n`);
+			console.log(`[PASSED]: ${testFile}\n`);
 			passed++;
 		} else {
-			console.error(`\n[FAILED]: ${testFile} (Exit code: ${result.status})\n`);
+			// ✅ 只在失败时，给一个简短错误摘要（不打印子脚本所有日志）
+			const errSnippet =
+				(result.stderr || result.stdout || "")
+					.toString()
+					.trim()
+					.split(/\r?\n/)
+					.slice(-10)
+					.join("\n") || "(no output)";
+			console.error(`[FAILED]: ${testFile} (Exit code: ${result.status})`);
+			console.error(`--- error (tail) ---\n${errSnippet}\n`);
 			failed++;
 		}
 	}
@@ -42,11 +54,10 @@ async function main() {
 	console.log(`SUMMARY: ${passed} Passed, ${failed} Failed`);
 	console.log("========================================");
 
-	if (failed > 0) {
-		process.exit(1);
-	} else {
-		process.exit(0);
-	}
+	process.exit(failed > 0 ? 1 : 0);
 }
 
-main();
+main().catch((e) => {
+	console.error(e);
+	process.exit(1);
+});
