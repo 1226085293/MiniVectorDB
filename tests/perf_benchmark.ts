@@ -64,7 +64,8 @@ function memSummary(m: NodeJS.MemoryUsage) {
 	};
 }
 
-function safeStatSize(file: string): number {
+function safeStatSize(file?: string | null): number {
+	if (!file) return 0;
 	try {
 		return fs.statSync(file).size;
 	} catch {
@@ -123,7 +124,7 @@ async function main() {
 	const k = parseInt(process.env.PERF_K || "10", 10);
 	const queryCount = parseInt(process.env.PERF_QUERIES || "200", 10);
 
-	// Windows 上 batch=2000 并发会导致抖动/峰值很高，建议默认更保守
+	// Windows 上 batch 并发过大容易抖动，默认保守一些
 	const batch = parseInt(process.env.PERF_BATCH || "500", 10);
 
 	const report = process.env.PERF_REPORT === "1";
@@ -152,7 +153,7 @@ async function main() {
 	const metaPath = path.join(caseDir, "metadata.json");
 	const vecPath = path.join(caseDir, "vectors.f32.bin");
 
-	// 关键：capacity 必须 >= N（建议留 buffer）
+	// capacity 必须 >= N（建议留 buffer）
 	const capacity = Math.floor(N * 1.1);
 
 	const db = new MiniVectorDB({
@@ -175,8 +176,7 @@ async function main() {
 			while (inserted < N) {
 				const end = Math.min(N, inserted + batch);
 
-				// ✅ 为了更稳定的 benchmark：串行/小并发更可靠
-				// 这里用 Promise.all(batch) 但 batch 默认较小
+				// 更稳定的 benchmark：小并发即可
 				const tasks: Promise<void>[] = [];
 				for (let i = inserted; i < end; i++) {
 					const v = genVec(dim, i + 1);
@@ -203,14 +203,20 @@ async function main() {
 		{ batch },
 	);
 
-	const statsAfterInsert = db.getStats();
+	// ✅ 关键修复：metaFile 不再用“猜路径”
+	// - 以 db.getStats() 返回的 metaPath 为准
+	// - vecPath / dumpPath 仍由测试脚本确定
+	const statsAfterInsert: any = db.getStats();
+	const realMetaPath: string =
+		statsAfterInsert.metaPath || statsAfterInsert.metaDbPath || metaPath;
+
 	const vecSize = safeStatSize(vecPath);
-	const metaSize = safeStatSize(metaPath);
+	const metaSize = safeStatSize(realMetaPath);
 
 	console.log("After insert:");
 	console.log("  dbStats:", statsAfterInsert);
 	console.log("  vecFile:", fmtBytes(vecSize));
-	console.log("  metaFile:", fmtBytes(metaSize));
+	console.log("  metaFile:", fmtBytes(metaSize), "| path:", realMetaPath);
 
 	const qIds = pickIds(N, queryCount);
 
@@ -321,7 +327,7 @@ async function main() {
 		capacity,
 		files: {
 			dumpPath,
-			metaPath,
+			metaPath: realMetaPath,
 			vecPath,
 			dumpBytes: dumpSize,
 			metaBytes: metaSize,
