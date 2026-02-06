@@ -14,9 +14,7 @@
 			"shrinkLevel": 1,
 			"converge": false,
 			"noAssert": true,
-			"enable": ["simd"],
-			"initialMemory": 100,
-			"maximumMemory": 32768
+			"enable": ["simd"]
 		}
 	},
 	"options": {}
