@@ -69,8 +69,21 @@ ${content}
 });
 
 // -------- 输出 --------
-const outputFile = `merged_${Date.now()}.md`;
-fs.writeFileSync(outputFile, mdContent, 'utf-8');
+const now = new Date();
+
+const pad = (n) => String(n).padStart(2, '0');
+
+const timestamp =
+    `${now.getFullYear()}-` +
+    `${pad(now.getMonth() + 1)}-` +
+    `${pad(now.getDate())}-` +
+    `${pad(now.getHours())}-` +
+    `${pad(now.getMinutes())}-` +
+    `${pad(now.getSeconds())}`;
+
+const outputFile = `merged_${timestamp}.md`;
+
+fs.writeFileSync(path.join("./temp", outputFile), mdContent, 'utf-8');
 
 console.log(`✅ 已生成 Markdown 文件: ${outputFile}`);
 console.log(`📄 共处理 ${collectedFiles.length} 个文件`);
