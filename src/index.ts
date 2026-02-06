@@ -1,7 +1,11 @@
 import { WasmBridge } from "./core/wasm-bridge";
 import { MetaDB } from "./storage/meta-db";
 import { LocalEmbedder } from "./embedder";
+import dotenv from "dotenv";
 import path from "path";
+
+// 加载本地 .env 配置
+dotenv.config({ path: path.join(__dirname, "../.env") });
 
 /**
  * @zh-CN 搜索结果项的接口定义。
@@ -69,10 +73,10 @@ export interface DBConfig {
  * @zh-CN MiniVectorDB 类，提供向量数据库的核心功能。
  */
 export class MiniVectorDB {
+	config: DBConfig;
 	private wasm: WasmBridge;
 	private meta: MetaDB;
 	private embedder: LocalEmbedder;
-	private config: DBConfig;
 	private isReady: boolean = false;
 
 	constructor(config: DBConfig = {}) {
@@ -80,7 +84,7 @@ export class MiniVectorDB {
 		this.wasm = new WasmBridge();
 		this.meta = new MetaDB(config.metaDbPath);
 		this.embedder = new LocalEmbedder(
-			config.modelName || "Xenova/all-MiniLM-L6-v2",
+			config.modelName || process.env.MODEL_NAME || "Xenova/all-MiniLM-L6-v2",
 			config.modelArchitecture,
 		);
 	}
@@ -89,9 +93,10 @@ export class MiniVectorDB {
 		if (this.isReady) return;
 
 		const wasmConfig = {
-			dim: this.config.dim || 384,
-			m: this.config.m || 16,
-			ef: this.config.ef_construction || 100,
+			dim: this.config.dim || Number(process.env.VECTOR_DIM ?? 0) || 384,
+			m: this.config.m || Number(process.env.HNSW_M ?? 0) || 16,
+			ef:
+				this.config.ef_construction || Number(process.env.HNSW_EF ?? 0) || 100,
 		};
 
 		await this.wasm.init(wasmConfig);

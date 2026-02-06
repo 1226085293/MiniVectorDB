@@ -14,6 +14,8 @@ import {
 	get_results_ptr,
 	get_state_ptr,
 	set_state_ptr,
+	save_index,
+	load_index,
 } from "./hnsw";
 import { dist_l2_sq, dist_dot } from "./math";
 import { update_config } from "./config";
@@ -31,6 +33,8 @@ export {
 	get_results_ptr,
 	get_state_ptr,
 	set_state_ptr,
+	save_index,
+	load_index,
 };
 export { dist_l2_sq, dist_dot };
 

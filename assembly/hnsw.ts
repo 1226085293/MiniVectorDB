@@ -325,3 +325,50 @@ export function set_state_ptr(ptr: usize): void {
 	results_buffer_ptr = load<usize>(ptr + 20);
 	max_elements = load<i32>(ptr + 24);
 }
+
+// 保存已用节点 + 全局状态
+export function save_index(ptr: usize): usize {
+	// ptr 指向外部 buffer, 返回写入字节数
+	// 布局:
+	// [0..3] element_count i32
+	// [4..31] statePtr 7 * i32 (id, max_level, ...)
+	// [32..] 节点数据按 element_count 序列化
+	store<i32>(ptr, element_count);
+	store<i32>(ptr + 4, entry_point_id);
+	store<i32>(ptr + 8, max_level);
+	store<i32>(ptr + 12, node_offsets_ptr as i32);
+	store<i32>(ptr + 16, vector_storage_ptr as i32);
+	store<i32>(ptr + 20, results_buffer_ptr as i32);
+	store<i32>(ptr + 24, max_elements);
+	store<i32>(ptr + 28, 0); // 备用
+
+	let offset = 32;
+	for (let i = 0; i < element_count; i++) {
+		let node_ptr = get_node_ptr(i);
+		let node_size = load<i32>(node_ptr + 4) + 8; // 简化示例
+		memory.copy(ptr + <usize>offset, node_ptr, <usize>node_size);
+		offset += node_size;
+	}
+
+	return offset; // 总字节数
+}
+
+export function load_index(ptr: usize, size: usize): void {
+	// 先读取全局状态
+	element_count = load<i32>(ptr);
+	entry_point_id = load<i32>(ptr + 4);
+	max_level = load<i32>(ptr + 8);
+	node_offsets_ptr = load<i32>(ptr + 12);
+	vector_storage_ptr = load<i32>(ptr + 16);
+	results_buffer_ptr = load<i32>(ptr + 20);
+	max_elements = load<i32>(ptr + 24);
+
+	// 节点恢复
+	let offset: usize = 32;
+	for (let i = 0; i < element_count; i++) {
+		let node_ptr = get_node_ptr(i);
+		let node_size = load<i32>(node_ptr + 4) + 8;
+		memory.copy(node_ptr, ptr + <usize>offset, <usize>node_size);
+		offset += node_size;
+	}
+}
