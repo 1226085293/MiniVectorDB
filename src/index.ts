@@ -38,8 +38,10 @@ export interface DBConfig {
 
 	seed?: number;
 
-	// ✅ new: results cap for wasm output buffer
 	resultsCap?: number;
+
+	// Optional cap for ANN candidates to avoid runaway memory/time
+	maxAnnK?: number;
 }
 
 export class MiniVectorDB {
@@ -52,6 +54,24 @@ export class MiniVectorDB {
 	private vecPath: string;
 	private vecFd: fs.promises.FileHandle | null = null;
 	private vecCache: Buffer | null = null;
+
+	// ✅ align host caps with wasm MAX_EF
+	private wasmMaxEf: number = 0;
+
+	// ✅ Global mutex to avoid meta/file/wasm divergence under concurrency
+	private opLock: Promise<void> = Promise.resolve();
+	private async withLock<T>(fn: () => Promise<T> | T): Promise<T> {
+		let release!: () => void;
+		const next = new Promise<void>((r) => (release = r));
+		const prev = this.opLock;
+		this.opLock = prev.then(() => next);
+		await prev;
+		try {
+			return await fn();
+		} finally {
+			release();
+		}
+	}
 
 	constructor(config: DBConfig = {}) {
 		this.config = config;
@@ -72,6 +92,27 @@ export class MiniVectorDB {
 
 	private bytesPerVec(): number {
 		return this.dim() * 4;
+	}
+
+	private capacity(): number {
+		return (
+			this.config.capacity ||
+			Number(process.env.HNSW_CAPACITY ?? 0) ||
+			1_200_000
+		);
+	}
+
+	private maxAnnK(): number {
+		const fromCfg = this.config.maxAnnK;
+		const fromEnv = process.env.MAX_ANN_K ? Number(process.env.MAX_ANN_K) : 0;
+		let cap = (fromCfg ?? fromEnv) || 10_000;
+
+		// ✅ align with wasm MAX_EF (otherwise wasted + confusing)
+		if (this.wasmMaxEf > 0) cap = Math.min(cap, this.wasmMaxEf);
+
+		// also reasonable hard floor
+		if (cap <= 0) cap = 1;
+		return cap;
 	}
 
 	private async ensureVectorStoreReady(): Promise<void> {
@@ -208,12 +249,18 @@ export class MiniVectorDB {
 			const bytes = count * bpv;
 
 			const buf = Buffer.allocUnsafe(bytes);
-			await fd.read(buf, 0, bytes, pos);
+			const { bytesRead } = await fd.read(buf, 0, bytes, pos);
+
+			// ✅ critical: no silent short-read
+			if (bytesRead !== bytes) {
+				throw new Error(
+					`Vector store short read. pos=${pos} need=${bytes} got=${bytesRead}`,
+				);
+			}
 
 			for (let j = 0; j < count; j++) {
 				const id = start + j;
 				const off = j * bpv;
-				if (off + bpv > buf.length) continue;
 
 				const dv = new DataView(buf.buffer, buf.byteOffset + off, bpv);
 				const v = new Float32Array(dim);
@@ -228,35 +275,59 @@ export class MiniVectorDB {
 	}
 
 	async init() {
-		if (this.isReady) return;
+		return this.withLock(async () => {
+			if (this.isReady) return;
 
-		const dim = this.dim();
-		const m = this.config.m || Number(process.env.HNSW_M ?? 0) || 16;
-		const ef =
-			this.config.ef_construction || Number(process.env.HNSW_EF ?? 0) || 100;
-		const efSearch =
-			this.config.ef_search || Number(process.env.HNSW_EF_SEARCH ?? 0) || 50;
+			const dim = this.dim();
+			const m = this.config.m || Number(process.env.HNSW_M ?? 0) || 16;
+			const ef =
+				this.config.ef_construction || Number(process.env.HNSW_EF ?? 0) || 100;
+			const efSearch =
+				this.config.ef_search || Number(process.env.HNSW_EF_SEARCH ?? 0) || 50;
 
-		const capacity =
-			this.config.capacity ||
-			Number(process.env.HNSW_CAPACITY ?? 0) ||
-			1_200_000;
+			const capacity = this.capacity();
 
-		const seedFromEnv = process.env.HNSW_SEED
-			? Number(process.env.HNSW_SEED) >>> 0
-			: undefined;
-		const seed =
-			this.config.seed != null ? this.config.seed >>> 0 : seedFromEnv;
+			const seedFromEnv = process.env.HNSW_SEED
+				? Number(process.env.HNSW_SEED) >>> 0
+				: undefined;
+			const seed =
+				this.config.seed != null ? this.config.seed >>> 0 : seedFromEnv;
 
-		const resultsCap =
-			(this.config.resultsCap ?? Number(process.env.HNSW_RESULTS_CAP ?? 0)) ||
-			1000;
+			const resultsCap =
+				(this.config.resultsCap ?? Number(process.env.HNSW_RESULTS_CAP ?? 0)) ||
+				1000;
 
-		await this.wasm.init({ dim, m, ef, efSearch, capacity, seed, resultsCap });
-		await this.meta.ready();
-		await this.ensureVectorStoreReady();
+			await this.wasm.init({
+				dim,
+				m,
+				ef,
+				efSearch,
+				capacity,
+				seed,
+				resultsCap,
+			});
 
-		this.isReady = true;
+			// ✅ align host caps with wasm MAX_EF
+			this.wasmMaxEf = await this.wasm.getMaxEf();
+
+			// also clamp resultsCap in wasm again (in case env/config > maxEf)
+			if (this.wasmMaxEf > 0) {
+				const clamp = Math.min(resultsCap, this.wasmMaxEf);
+				await this.wasm.setResultsCap(clamp);
+			}
+
+			await this.meta.ready();
+			await this.ensureVectorStoreReady();
+
+			const wasmCap = await this.wasm.getMaxElements();
+			if (wasmCap && wasmCap !== capacity) {
+				throw new Error(
+					`WASM capacity mismatch. expected=${capacity}, wasm=${wasmCap}`,
+				);
+			}
+
+			this.isReady = true;
+		});
 	}
 
 	private async resolveVectorToF32(
@@ -273,131 +344,192 @@ export class MiniVectorDB {
 		return new Float32Array(vector);
 	}
 
+	private ensureWithinCapacity(internalId: number) {
+		const cap = this.capacity();
+		if (internalId < 0 || internalId >= cap) {
+			throw new Error(
+				`Internal ID out of capacity. id=${internalId}, capacity=${cap}. ` +
+					`Increase HNSW_CAPACITY / config.capacity.`,
+			);
+		}
+	}
+
+	private ensureAllocWithinCapacity(start: number, n: number) {
+		const cap = this.capacity();
+		const endExclusive = start + n;
+		if (start < 0 || n <= 0 || endExclusive > cap) {
+			throw new Error(
+				`Capacity overflow. need [${start}, ${endExclusive}) but capacity=${cap}. ` +
+					`Increase HNSW_CAPACITY / config.capacity.`,
+			);
+		}
+	}
+
 	async insert(item: InsertItem): Promise<void> {
 		await this.insertMany([item]);
 	}
 
-	/**
-	 * ✅ Bulk insert optimized + safe internal_id allocation
-	 */
 	async insertMany(items: InsertItem[]): Promise<void> {
-		if (!this.isReady) await this.init();
-		if (items.length === 0) return;
+		return this.withLock(async () => {
+			if (!this.isReady) await this.init();
+			if (items.length === 0) return;
 
-		const expectedDim = this.dim();
+			const expectedDim = this.dim();
 
-		const externalIds = items.map((it) => it.id);
-		const existingMap = this.meta.getMany(externalIds);
+			const externalIds = items.map((it) => it.id);
+			const existingMap = this.meta.getMany(externalIds);
 
-		// count new items first to allocate consecutive internal ids safely
-		let newItemsCount = 0;
-		for (const it of items) if (!existingMap.get(it.id)) newItemsCount++;
+			let newItemsCount = 0;
+			for (const it of items) if (!existingMap.get(it.id)) newItemsCount++;
 
-		const newStartId =
-			newItemsCount > 0 ? this.meta.allocInternalIds(newItemsCount) : 0;
-		let newCursor = 0;
+			// ✅ BEGIN BULK (we'll COMMIT only after vectors+wasm succeed)
+			this.meta.beginBulk();
+			let commit = false;
 
-		const f32s: Float32Array[] = new Array(items.length);
-		const q8s: Int8Array[] = new Array(items.length);
-		const internalIds: number[] = new Array(items.length);
-		const isNew: boolean[] = new Array(items.length);
-
-		const metaEntries: {
-			external_id: string;
-			internal_id: number;
-			metadata: any;
-		}[] = new Array(items.length);
-
-		this.meta.beginBulk();
-		try {
-			for (let i = 0; i < items.length; i++) {
-				const { id, vector, metadata } = items[i];
-				const f32 = await this.resolveVectorToF32(vector);
-
-				if (f32.length !== expectedDim) {
-					throw new Error(
-						`Vector dimension mismatch. Expected ${expectedDim}, got ${f32.length}`,
-					);
+			try {
+				let newStartId = 0;
+				if (newItemsCount > 0) {
+					newStartId = this.meta.allocInternalIds(newItemsCount);
+					this.ensureAllocWithinCapacity(newStartId, newItemsCount);
 				}
 
-				const q8 = this.quantizeToI8(f32);
+				let newCursor = 0;
 
-				const existing = existingMap.get(id);
-				if (existing) {
-					internalIds[i] = existing.internal_id;
-					isNew[i] = false;
+				const f32s: Float32Array[] = new Array(items.length);
+				const q8s: Int8Array[] = new Array(items.length);
+				const internalIds: number[] = new Array(items.length);
+				const isNew: boolean[] = new Array(items.length);
 
-					metaEntries[i] = {
-						external_id: id,
-						internal_id: existing.internal_id,
-						metadata: metadata ?? existing.metadata,
-					};
-				} else {
-					const newInternalId = newStartId + newCursor;
-					newCursor++;
+				const metaEntries: {
+					external_id: string;
+					internal_id: number;
+					metadata: any;
+				}[] = new Array(items.length);
 
-					internalIds[i] = newInternalId;
-					isNew[i] = true;
+				// 1) resolve vectors + assign internal ids (NO meta write yet)
+				for (let i = 0; i < items.length; i++) {
+					const { id, vector, metadata } = items[i];
+					const f32 = await this.resolveVectorToF32(vector);
 
-					metaEntries[i] = {
-						external_id: id,
-						internal_id: newInternalId,
-						metadata: metadata || {},
-					};
-				}
-
-				f32s[i] = f32;
-				q8s[i] = q8;
-			}
-
-			// 3) single meta write
-			this.meta.addMany(metaEntries, existingMap);
-
-			// 4) write all NEW ids as contiguous runs
-			{
-				const pairs: { id: number; vec: Float32Array }[] = [];
-				for (let i = 0; i < items.length; i++)
-					if (isNew[i]) pairs.push({ id: internalIds[i], vec: f32s[i] });
-				pairs.sort((a, b) => a.id - b.id);
-
-				let p = 0;
-				while (p < pairs.length) {
-					const start = pairs[p].id;
-					const vecs: Float32Array[] = [pairs[p].vec];
-					let end = start;
-
-					while (p + 1 < pairs.length && pairs[p + 1].id === end + 1) {
-						p++;
-						end = pairs[p].id;
-						vecs.push(pairs[p].vec);
+					if (f32.length !== expectedDim) {
+						throw new Error(
+							`Vector dimension mismatch. Expected ${expectedDim}, got ${f32.length}`,
+						);
 					}
 
-					await this.writeF32VectorsContiguous(start, vecs);
-					p++;
-				}
-			}
+					const q8 = this.quantizeToI8(f32);
 
-			// 5) updates: write individually
-			for (let i = 0; i < items.length; i++) {
-				if (!isNew[i]) {
-					await this.writeF32Vector(internalIds[i], f32s[i]);
-				}
-			}
+					const existing = existingMap.get(id);
+					if (existing) {
+						this.ensureWithinCapacity(existing.internal_id);
 
-			// 6) wasm graph ops (async + locked inside bridge)
-			for (let i = 0; i < items.length; i++) {
-				const internalId = internalIds[i];
-				const q8 = q8s[i];
+						internalIds[i] = existing.internal_id;
+						isNew[i] = false;
 
-				if (await this.wasm.hasNode(internalId)) {
-					await this.wasm.updateVector(internalId, q8);
-				} else {
-					await this.wasm.insert(internalId, q8);
+						metaEntries[i] = {
+							external_id: id,
+							internal_id: existing.internal_id,
+							metadata: metadata ?? existing.metadata,
+						};
+					} else {
+						const newInternalId = newStartId + newCursor;
+						newCursor++;
+
+						this.ensureWithinCapacity(newInternalId);
+
+						internalIds[i] = newInternalId;
+						isNew[i] = true;
+
+						metaEntries[i] = {
+							external_id: id,
+							internal_id: newInternalId,
+							metadata: metadata || {},
+						};
+					}
+
+					f32s[i] = f32;
+					q8s[i] = q8;
 				}
+
+				// 2) write vectors (new contiguous runs first)
+				{
+					const pairs: { id: number; vec: Float32Array }[] = [];
+					for (let i = 0; i < items.length; i++)
+						if (isNew[i]) pairs.push({ id: internalIds[i], vec: f32s[i] });
+					pairs.sort((a, b) => a.id - b.id);
+
+					let p = 0;
+					while (p < pairs.length) {
+						const start = pairs[p].id;
+						const vecs: Float32Array[] = [pairs[p].vec];
+						let end = start;
+
+						while (p + 1 < pairs.length && pairs[p + 1].id === end + 1) {
+							p++;
+							end = pairs[p].id;
+							vecs.push(pairs[p].vec);
+						}
+
+						await this.writeF32VectorsContiguous(start, vecs);
+						p++;
+					}
+				}
+
+				// existing: write individually
+				for (let i = 0; i < items.length; i++) {
+					if (!isNew[i]) {
+						await this.writeF32Vector(internalIds[i], f32s[i]);
+					}
+				}
+
+				// ✅ fsync vectors BEFORE committing meta (crash-consistency)
+				if (this.vecFd) {
+					await this.vecFd.sync();
+				}
+
+				// 3) wasm graph ops
+				for (let i = 0; i < items.length; i++) {
+					const internalId = internalIds[i];
+					const q8 = q8s[i];
+
+					if (isNew[i]) {
+						await this.wasm.insert(internalId, q8);
+					} else {
+						if (await this.wasm.hasNode(internalId)) {
+							await this.wasm.updateVector(internalId, q8);
+						} else {
+							await this.wasm.insert(internalId, q8);
+						}
+					}
+				}
+
+				// 4) commit meta LAST
+				this.meta.addMany(metaEntries, existingMap);
+
+				commit = true;
+			} finally {
+				// ✅ commit=true only if fully succeeded; otherwise rollback bulk changes
+				await this.meta.endBulk(commit);
 			}
-		} finally {
-			await this.meta.endBulk();
+		});
+	}
+
+	private async ensureResultsCapAtLeast(n: number) {
+		if (n <= 0) return;
+
+		// ✅ clamp to wasm MAX_EF
+		if (this.wasmMaxEf > 0) {
+			n = Math.min(n, this.wasmMaxEf);
 		}
+
+		const cur = await this.wasm.getResultsCap();
+		if (cur >= n) return;
+
+		// grow (still clamped inside wasm bridge)
+		let next = cur > 0 ? cur : 1000;
+		while (next < n) next = next * 2;
+
+		await this.wasm.setResultsCap(next);
 	}
 
 	async search(
@@ -405,132 +537,103 @@ export class MiniVectorDB {
 		k: number = 10,
 		filter?: any,
 	): Promise<SearchResult[]> {
-		if (!this.isReady) await this.init();
+		// ✅ serialize with writes to avoid reading partially-written vector/meta state
+		return this.withLock(async () => {
+			if (!this.isReady) await this.init();
 
-		let qF32: Float32Array;
-		if (
-			typeof query === "string" ||
-			query instanceof Buffer ||
-			query instanceof Uint8Array
-		) {
-			qF32 = await this.embedder.embed(query);
-		} else if (query instanceof Float32Array) {
-			qF32 = query;
-		} else {
-			qF32 = new Float32Array(query);
-		}
-
-		const expectedDim = this.dim();
-		if (qF32.length !== expectedDim) {
-			throw new Error(
-				`Query vector dimension mismatch. Expected ${expectedDim}, got ${qF32.length}`,
-			);
-		}
-
-		const qI8 = this.quantizeToI8(qF32);
-
-		const mult = this.config.rerankMultiplier ?? 30;
-		const annK = Math.max(k * mult, k);
-
-		const raw = await this.wasm.search(qI8, annK);
-		if (raw.length === 0) return [];
-
-		const candidates: number[] = [];
-		for (const r of raw) {
-			const item = this.meta.getByInternalId(r.id);
-			if (!item) continue;
-
-			if (filter) {
-				let match = true;
-				for (const key in filter) {
-					if (item.metadata[key] !== filter[key]) {
-						match = false;
-						break;
-					}
-				}
-				if (!match) continue;
+			let qF32: Float32Array;
+			if (
+				typeof query === "string" ||
+				query instanceof Buffer ||
+				query instanceof Uint8Array
+			) {
+				qF32 = await this.embedder.embed(query);
+			} else if (query instanceof Float32Array) {
+				qF32 = query;
+			} else {
+				qF32 = new Float32Array(query);
 			}
 
-			candidates.push(r.id);
-			if (candidates.length >= annK) break;
-		}
-		if (candidates.length === 0) return [];
+			const expectedDim = this.dim();
+			if (qF32.length !== expectedDim) {
+				throw new Error(
+					`Query vector dimension mismatch. Expected ${expectedDim}, got ${qF32.length}`,
+				);
+			}
 
-		const vecMap = await this.readF32Vectors(candidates);
+			const qI8 = this.quantizeToI8(qF32);
 
-		const reranked: { internalId: number; score: number }[] = [];
-		for (const internalId of candidates) {
-			const v = vecMap.get(internalId);
-			if (!v) continue;
-			reranked.push({ internalId, score: this.l2SqF32(qF32, v) });
-		}
+			const mult = this.config.rerankMultiplier ?? 30;
+			let annK = Math.max(k * mult, k);
 
-		reranked.sort((a, b) => a.score - b.score);
+			// ✅ cap ANN candidates to avoid runaway (and align with wasm MAX_EF)
+			const cap = this.maxAnnK();
+			if (annK > cap) annK = cap;
 
-		const results: SearchResult[] = [];
-		for (const r of reranked) {
-			const item = this.meta.getByInternalId(r.internalId);
-			if (!item) continue;
+			await this.ensureResultsCapAtLeast(annK);
 
-			results.push({
-				id: item.external_id,
-				score: r.score,
-				metadata: item.metadata,
-			});
-			if (results.length >= k) break;
-		}
+			const allowedSet = filter ? this.meta.filterInternalIdSet(filter) : null;
 
-		return results;
-	}
+			const raw = await this.wasm.search(qI8, annK);
+			if (raw.length === 0) return [];
 
-	/**
-	 * ✅ Expose ANN-stage raw results (WASM HNSW on Int8 L2^2) for benchmarking.
-	 */
-	async searchAnnI8(
-		query: number[] | Float32Array | string | Buffer | Uint8Array,
-		annK: number,
-	): Promise<{ internalId: number; dist: number }[]> {
-		if (!this.isReady) await this.init();
+			const candidates: number[] = [];
+			for (const r of raw) {
+				if (allowedSet && !allowedSet.has(r.id)) continue;
 
-		let qF32: Float32Array;
-		if (
-			typeof query === "string" ||
-			query instanceof Buffer ||
-			query instanceof Uint8Array
-		) {
-			qF32 = await this.embedder.embed(query);
-		} else if (query instanceof Float32Array) {
-			qF32 = query;
-		} else {
-			qF32 = new Float32Array(query);
-		}
+				const item = this.meta.getByInternalId(r.id);
+				if (!item) continue;
 
-		const expectedDim = this.dim();
-		if (qF32.length !== expectedDim) {
-			throw new Error(
-				`Query vector dimension mismatch. Expected ${expectedDim}, got ${qF32.length}`,
-			);
-		}
+				candidates.push(r.id);
+				if (candidates.length >= annK) break;
+			}
+			if (candidates.length === 0) return [];
 
-		const qI8 = this.quantizeToI8(qF32);
-		const raw = await this.wasm.search(qI8, annK);
+			const vecMap = await this.readF32Vectors(candidates);
 
-		return raw.map((r) => ({ internalId: r.id, dist: r.dist }));
+			const reranked: { internalId: number; score: number }[] = [];
+			for (const internalId of candidates) {
+				const v = vecMap.get(internalId);
+				if (!v) continue;
+				reranked.push({ internalId, score: this.l2SqF32(qF32, v) });
+			}
+
+			reranked.sort((a, b) => a.score - b.score);
+
+			const results: SearchResult[] = [];
+			for (const r of reranked) {
+				const item = this.meta.getByInternalId(r.internalId);
+				if (!item) continue;
+
+				results.push({
+					id: item.external_id,
+					score: r.score,
+					metadata: item.metadata,
+				});
+				if (results.length >= k) break;
+			}
+
+			return results;
+		});
 	}
 
 	async save(filepath: string) {
-		await this.wasm.save(filepath);
-		if (this.vecFd) await this.vecFd.sync();
+		return this.withLock(async () => {
+			await this.wasm.save(filepath);
+			if (this.vecFd) await this.vecFd.sync();
+		});
 	}
 
 	async load(filepath: string) {
-		if (!this.isReady) await this.init();
-		await this.wasm.load(filepath);
-		await this.ensureVectorStoreReady();
+		return this.withLock(async () => {
+			if (!this.isReady) await this.init();
+			await this.wasm.load(filepath);
+			await this.ensureVectorStoreReady();
 
-		if (this.config.preloadVectors && fs.existsSync(this.vecPath)) {
-			this.vecCache = await fs.promises.readFile(this.vecPath);
-		}
+			if (this.config.preloadVectors && fs.existsSync(this.vecPath)) {
+				this.vecCache = await fs.promises.readFile(this.vecPath);
+			}
+		});
 	}
 
 	getStats() {
@@ -540,15 +643,18 @@ export class MiniVectorDB {
 			capacity: this.config.capacity,
 			metaPath: this.meta.getPath(),
 			preloadVectors: !!this.config.preloadVectors,
+			wasmMaxEf: this.wasmMaxEf || undefined,
 		};
 	}
 
 	async close() {
-		await this.meta.close();
-		if (this.vecFd) {
-			await this.vecFd.close();
-			this.vecFd = null;
-		}
-		this.vecCache = null;
+		return this.withLock(async () => {
+			await this.meta.close();
+			if (this.vecFd) {
+				await this.vecFd.close();
+				this.vecFd = null;
+			}
+			this.vecCache = null;
+		});
 	}
 }

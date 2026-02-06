@@ -17,7 +17,6 @@ export class MetaDB {
 	private bulkDepth = 0;
 	private autosaveWasEnabled = true;
 
-	// ✅ monotonic allocator (in-memory), initialized from max(internal_id)+1
 	private nextInternalId: number = 0;
 	private nextIdInitialized = false;
 
@@ -74,47 +73,56 @@ export class MetaDB {
 		});
 	}
 
-	/**
-	 * Bulk mode:
-	 * - disables autosave during massive insert/update
-	 * - endBulk will do a single saveDatabase()
-	 */
 	beginBulk(): void {
 		this.bulkDepth++;
 		if (this.bulkDepth === 1) {
+			// best-effort: detect autosave enabled (lokijs doesn't expose cleanly in types)
 			this.autosaveWasEnabled = true;
 			try {
 				// @ts-ignore
 				this.db.autosaveDisable();
-			} catch {
-				// ignore
-			}
+			} catch {}
 		}
 	}
 
-	async endBulk(): Promise<void> {
+	/**
+	 * ✅ endBulk(commit)
+	 * - commit=true: 保存数据库并恢复 autosave
+	 * - commit=false: 丢弃 bulk 期间的内存变更（通过 reloadDatabase 回滚到磁盘版本）
+	 */
+	async endBulk(commit: boolean = true): Promise<void> {
 		if (this.bulkDepth <= 0) return;
 		this.bulkDepth--;
-		if (this.bulkDepth === 0) {
+
+		if (this.bulkDepth !== 0) return;
+
+		if (commit) {
 			await new Promise<void>((resolve, reject) => {
 				this.db.saveDatabase((err) => {
 					if (err) return reject(err);
 					resolve();
 				});
 			});
+		} else {
+			// ✅ rollback: reload from disk
+			await new Promise<void>((resolve, reject) => {
+				this.db.loadDatabase({}, (err) => {
+					if (err) return reject(err);
+					this.initCollection();
+					this.initNextIdFromDB();
+					resolve();
+				});
+			});
+		}
 
-			if (this.autosaveWasEnabled) {
-				try {
-					// @ts-ignore
-					this.db.autosaveEnable();
-				} catch {
-					// ignore
-				}
-			}
+		if (this.autosaveWasEnabled) {
+			try {
+				// @ts-ignore
+				this.db.autosaveEnable();
+			} catch {}
 		}
 	}
 
-	// ✅ allocate n consecutive internal ids safely
 	allocInternalIds(n: number): number {
 		if (n <= 0) throw new Error(`allocInternalIds invalid n=${n}`);
 		if (!this.nextIdInitialized) this.initNextIdFromDB();
@@ -123,7 +131,6 @@ export class MetaDB {
 		return start;
 	}
 
-	// ---- Single ops ----
 	add(externalId: string, internalId: number, metadata: any) {
 		if (!this.items) this.initCollection();
 		if (!this.nextIdInitialized) this.initNextIdFromDB();
@@ -141,7 +148,6 @@ export class MetaDB {
 			};
 			this.items.insert(newItem);
 
-			// keep allocator monotonic if user inserted with large internalId
 			if (internalId >= this.nextInternalId)
 				this.nextInternalId = internalId + 1;
 		}
@@ -157,7 +163,6 @@ export class MetaDB {
 		return this.items.findOne({ internal_id: internalId });
 	}
 
-	// ---- Batch ops (✅ perf) ----
 	getMany(externalIds: string[]): Map<string, Item> {
 		const out = new Map<string, Item>();
 		if (!this.items || externalIds.length === 0) return out;
@@ -168,6 +173,7 @@ export class MetaDB {
 		const rows = this.items.find({
 			external_id: { $in: unique } as any,
 		} as any);
+
 		for (const r of rows) out.set(r.external_id, r);
 		return out;
 	}
@@ -212,12 +218,26 @@ export class MetaDB {
 		return this.items.count();
 	}
 
-	filter(query: any): number[] {
-		if (!this.items) return [];
-		return this.items.find(query).map((r) => r.internal_id);
+	filterInternalIdSet(query: any): Set<number> {
+		const set = new Set<number>();
+		if (!this.items) return set;
+
+		const rows = this.items.find(query as any) as any[];
+		for (const r of rows) {
+			if (typeof r.internal_id === "number") set.add(r.internal_id);
+		}
+		return set;
 	}
 
+	// ✅ 关键修复：关闭前禁用 autosave，避免 interval 残留导致进程不退出
 	close(): Promise<void> {
-		return new Promise((resolve) => this.db.close(resolve));
+		try {
+			// @ts-ignore
+			this.db.autosaveDisable?.();
+		} catch {}
+
+		return new Promise((resolve) => {
+			this.db.close(() => resolve());
+		});
 	}
 }

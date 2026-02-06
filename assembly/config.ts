@@ -60,17 +60,64 @@ export let EF_SEARCH: i32 = 50;
 export const NULL_PTR: i32 = 0;
 
 /**
+ * @zh-CN 内部：是否已经初始化过 index（防止 init 后改 DIM/M 导致步长错乱）
+ * @en Internal: whether index has been initialized.
+ */
+let INDEX_INITED: bool = false;
+
+/**
+ * @zh-CN 标记 index 已初始化（由 hnsw.init_index 调用）
+ * @en Mark index initialized (called by hnsw.init_index).
+ */
+export function mark_index_inited(): void {
+	INDEX_INITED = true;
+}
+
+/**
+ * @zh-CN 标记 index 已重置（capacity<=0 时）
+ * @en Mark index reset (capacity<=0).
+ */
+export function mark_index_reset(): void {
+	INDEX_INITED = false;
+}
+
+@inline
+function is_pow2(x: i32): bool {
+	return x > 0 && (x & (x - 1)) == 0;
+}
+
+/**
  * @zh-CN 更新核心配置参数。
  *         此函数必须在调用 init_index 或 insert 之前调用。
  * @en Updates the core configuration parameters.
  *       This function must be called before calling init_index or insert.
  */
 export function update_config(dim: i32, m: i32, ef_construction: i32): void {
+	// ✅ validations
+	if (dim <= 0) unreachable();
+	if ((dim & 3) != 0) unreachable(); // must be multiple of 4
+	if (m <= 0) unreachable();
+	if (ef_construction <= 0) unreachable();
+
+	// ✅ allow idempotent calls after init (load() often calls set_config again)
+	if (INDEX_INITED) {
+		if (dim == DIM && m == M && ef_construction == EF_CONSTRUCTION) {
+			// same config -> safe no-op
+			return;
+		}
+		// changing DIM/M/EF after init would corrupt layout
+		unreachable();
+	}
+
 	DIM = dim;
 	M = m;
 	EF_CONSTRUCTION = ef_construction;
 	M_MAX0 = m * 2;
+
+	if (MAX_LAYERS <= 0) unreachable();
+	if (M_MAX0 <= 0) unreachable();
 }
+
 
 /**
  * @zh-CN 更新搜索阶段 ef (efSearch)。
@@ -78,5 +125,6 @@ export function update_config(dim: i32, m: i32, ef_construction: i32): void {
  * @en Updates efSearch for query-time. Safe to adjust at runtime.
  */
 export function update_search_config(ef_search: i32): void {
+	if (ef_search <= 0) return;
 	EF_SEARCH = ef_search;
 }

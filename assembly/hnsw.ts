@@ -3,7 +3,7 @@
 
 import { dist_l2_sq } from "./math";
 import { alloc } from "./memory";
-import { M, M_MAX0, EF_CONSTRUCTION, EF_SEARCH, MAX_LAYERS, DIM } from "./config";
+import { M, M_MAX0, EF_CONSTRUCTION, EF_SEARCH, MAX_LAYERS, DIM, mark_index_inited, mark_index_reset } from "./config";
 import { get_node_size, get_vector_size } from "./types";
 
 // --- GLOBALS ---
@@ -13,14 +13,18 @@ let element_count: i32 = 0; // number of PRESENT nodes (not inserts)
 let node_offsets_ptr: usize = 0;
 let vector_storage_ptr: usize = 0;
 
+// ✅ results buffer is FIXED to MAX_EF (prevents set_results_cap overflow)
 let results_buffer_ptr: usize = 0;
-let results_cap: i32 = 1000; // configurable
+let results_cap: i32 = 1000; // logical cap (clamped <= MAX_EF)
 
 let max_elements: i32 = 0;
 
 // --- VISITED (STAMP) ---
-let visited_mark_ptr: usize = 0; // i32[max_elements]
-let visited_stamp: i32 = 1;
+let visited_mark_ptr: usize = 0; // u32[max_elements]
+let visited_stamp: u32 = 1;
+
+// --- EF clamp monitor ---
+let ef_clamped_flag: i32 = 0;
 
 // --- HEAP BUFFERS (REUSED, NO GC) ---
 const MAX_EF: i32 = 4096;
@@ -43,6 +47,9 @@ let used_mark_ptr: usize = 0; // u8[MAX_EF]
 // neighbor selection scratch
 let sel_ids_ptr: usize = 0; // i32[MAX_EF]
 let sel_count: i32 = 0;
+
+// ✅ FIX: dedicated old-neighbors buffer (prevents overwrite by search_layer)
+let old_ids_ptr: usize = 0; // i32[MAX_EF]
 
 // --- RNG (xorshift32) ---
 let rng_state: u32 = 2463534242; // default non-zero
@@ -69,8 +76,32 @@ function rand01(): f64 {
 
 // --- CONFIG API ---
 export function set_results_cap(cap: i32): void {
+	// ✅ safe: cap only controls how many items host will read,
+	// result buffer is fixed to MAX_EF, and search clamps out_count.
 	if (cap <= 0) return;
+	if (cap > MAX_EF) cap = MAX_EF;
 	results_cap = cap;
+}
+
+export function get_results_cap(): i32 {
+	return results_cap;
+}
+
+export function get_max_ef(): i32 {
+	return MAX_EF;
+}
+
+export function was_ef_clamped(): i32 {
+	return ef_clamped_flag;
+}
+
+export function clear_ef_clamped(): void {
+	ef_clamped_flag = 0;
+}
+
+// ✅ expose capacity to host (hard safety checks)
+export function get_max_elements(): i32 {
+	return max_elements;
 }
 
 // --- HELPERS ---
@@ -85,17 +116,17 @@ function get_vector_ptr(id: i32): usize {
 }
 
 function visited_get(id: i32): bool {
-	return load<i32>(visited_mark_ptr + <usize>id * 4) == visited_stamp;
+	return load<u32>(visited_mark_ptr + <usize>id * 4) == visited_stamp;
 }
 function visited_set(id: i32): void {
-	store<i32>(visited_mark_ptr + <usize>id * 4, visited_stamp);
+	store<u32>(visited_mark_ptr + <usize>id * 4, visited_stamp);
 }
 function visited_next_stamp(): void {
 	visited_stamp++;
 	if (visited_stamp == 0) {
 		visited_stamp = 1;
 		for (let i: i32 = 0; i < max_elements; i++) {
-			store<i32>(visited_mark_ptr + <usize>i * 4, 0);
+			store<u32>(visited_mark_ptr + <usize>i * 4, 0);
 		}
 	}
 }
@@ -328,17 +359,25 @@ function res_extract_k_smallest_sorted(res_size: i32, k: i32): i32 {
 
 // --- INIT ---
 export function init_index(capacity: i32): void {
+	if (capacity <= 0) {
+		entry_point_id = -1;
+		max_level = -1;
+		element_count = 0;
+		max_elements = 0;
+		mark_index_reset();
+		return;
+	}
+
 	max_elements = capacity;
 
+	// alloc now aligns to 16 by default (memory.ts)
 	node_offsets_ptr = alloc(<usize>capacity * 4);
 	vector_storage_ptr = alloc(<usize>capacity * get_vector_size());
 
-	// ✅ configurable results cap
-	let cap = results_cap;
-	if (cap <= 0) cap = 1000;
-	if (cap > 1_000_000) cap = 1_000_000;
-	results_cap = cap;
-	results_buffer_ptr = alloc(<usize>cap * 8);
+	// ✅ results buffer fixed to MAX_EF always
+	if (results_cap <= 0) results_cap = 1000;
+	if (results_cap > MAX_EF) results_cap = MAX_EF;
+	results_buffer_ptr = alloc(<usize>MAX_EF * 8);
 
 	visited_mark_ptr = alloc(<usize>capacity * 4);
 
@@ -353,18 +392,25 @@ export function init_index(capacity: i32): void {
 	used_mark_ptr = alloc(<usize>MAX_EF); // u8
 	sel_ids_ptr = alloc(<usize>MAX_EF * 4);
 
+	// ✅ FIX: old-neighbors buffer
+	old_ids_ptr = alloc(<usize>MAX_EF * 4);
+
 	entry_point_id = -1;
 	max_level = -1;
 	element_count = 0;
 	visited_stamp = 1;
+	ef_clamped_flag = 0;
 
 	for (let i: i32 = 0; i < capacity; i++) {
 		set_node_ptr(i, 0);
-		store<i32>(visited_mark_ptr + <usize>i * 4, 0);
+		store<u32>(visited_mark_ptr + <usize>i * 4, 0);
 	}
 	for (let i: i32 = 0; i < MAX_EF; i++) {
 		store<u8>(used_mark_ptr + <usize>i, 0);
 	}
+
+	// ✅ prevent update_config after init
+	mark_index_inited();
 }
 
 function get_random_level(): i32 {
@@ -383,7 +429,10 @@ function search_layer(
 	target: i32,
 ): i32 {
 	if (ef <= 0) return 0;
-	if (ef > MAX_EF) ef = MAX_EF;
+	if (ef > MAX_EF) {
+		ef = MAX_EF;
+		ef_clamped_flag = 1;
+	}
 
 	visited_next_stamp();
 
@@ -421,9 +470,11 @@ function search_layer(
 
 		for (let i = 0; i < neighbor_count; i++) {
 			let neighbor_id = load<i32>(neighbors_start + <usize>i * 4);
-			if (neighbor_id < 0 || neighbor_id >= max_elements) continue;
-			if (visited_get(neighbor_id)) continue;
 
+			if (neighbor_id < 0) continue;
+			if (neighbor_id >= max_elements) continue;
+
+			if (visited_get(neighbor_id)) continue;
 			visited_set(neighbor_id);
 
 			let d = dist_l2_sq(query_vec_ptr, get_vector_ptr(neighbor_id));
@@ -505,17 +556,31 @@ function select_neighbors_heuristic(query_vec_ptr: usize, found: i32, target: i3
 	return sel_count;
 }
 
-// --- CONNECTION LOGIC ---
-function add_connection(src: i32, dst: i32, layer: i32): void {
-	let ptr = get_node_ptr(src);
-	let runner = ptr + 8;
+// --- LAYER POINTER HELPERS ---
+@inline
+function get_layer_runner_ptr(node_ptr: usize, layer: i32): usize {
+	let runner = node_ptr + 8;
 	for (let l = 0; l < layer; l++) {
 		let cap = l == 0 ? M_MAX0 : M;
 		runner += 4 + <usize>cap * 4;
 	}
+	return runner; // points to [count] of that layer
+}
+
+@inline
+function layer_cap(layer: i32): i32 {
+	return layer == 0 ? M_MAX0 : M;
+}
+
+// --- CONNECTION LOGIC ---
+function add_connection(src: i32, dst: i32, layer: i32): void {
+	let ptr = get_node_ptr(src);
+	if (ptr == 0) return;
+
+	let runner = get_layer_runner_ptr(ptr, layer);
 
 	let count = load<i32>(runner);
-	let cap_cur = layer == 0 ? M_MAX0 : M;
+	let cap_cur = layer_cap(layer);
 	let neighbors_ptr = runner + 4;
 
 	for (let i = 0; i < count; i++) {
@@ -527,11 +592,20 @@ function add_connection(src: i32, dst: i32, layer: i32): void {
 		store<i32>(runner, count + 1);
 	} else {
 		let src_vec = get_vector_ptr(src);
+
+		// ✅ if there are invalid slots, replace them first
 		let worst_idx = -1;
 		let worst_dist: f32 = -1.0;
 
 		for (let i = 0; i < count; i++) {
 			let n_id = load<i32>(neighbors_ptr + <usize>i * 4);
+
+			if (n_id < 0 || n_id >= max_elements) {
+				worst_idx = i;
+				worst_dist = 99999999.0;
+				break;
+			}
+
 			let d = dist_l2_sq(src_vec, get_vector_ptr(n_id));
 			if (d > worst_dist) {
 				worst_dist = d;
@@ -540,9 +614,87 @@ function add_connection(src: i32, dst: i32, layer: i32): void {
 		}
 
 		let dst_dist = dist_l2_sq(src_vec, get_vector_ptr(dst));
-		if (dst_dist < worst_dist && worst_idx >= 0) {
+		if (worst_idx >= 0 && dst_dist < worst_dist) {
+			// ✅ FIX: remove reverse edge from the victim neighbor
+			let victim = load<i32>(neighbors_ptr + <usize>worst_idx * 4);
+
 			store<i32>(neighbors_ptr + <usize>worst_idx * 4, dst);
+
+			if (victim >= 0 && victim < max_elements && victim != dst && victim != src) {
+				remove_connection(victim, src, layer);
+			}
 		}
+	}
+}
+
+// ✅ remove a connection (used by reconnect to avoid "only add never remove")
+function remove_connection(src: i32, dst: i32, layer: i32): void {
+	let ptr = get_node_ptr(src);
+	if (ptr == 0) return;
+
+	let runner = get_layer_runner_ptr(ptr, layer);
+	let count = load<i32>(runner);
+	if (count <= 0) return;
+
+	let cap_cur = layer_cap(layer);
+	let neighbors_ptr = runner + 4;
+
+	for (let i: i32 = 0; i < count; i++) {
+		let nid = load<i32>(neighbors_ptr + <usize>i * 4);
+		if (nid != dst) continue;
+
+		// swap with last active
+		let last_idx = count - 1;
+		let last_id = load<i32>(neighbors_ptr + <usize>last_idx * 4);
+
+		store<i32>(neighbors_ptr + <usize>i * 4, last_id);
+		store<i32>(neighbors_ptr + <usize>last_idx * 4, -1);
+
+		store<i32>(runner, count - 1);
+
+		// keep the rest slots as-is
+		for (let t = count; t < cap_cur; t++) {
+			// no-op
+		}
+		return;
+	}
+}
+
+// ✅ overwrite neighbor list for a node at a layer
+function overwrite_neighbors(id: i32, layer: i32, picked_count: i32): void {
+	let node_ptr = get_node_ptr(id);
+	if (node_ptr == 0) return;
+
+	let runner = get_layer_runner_ptr(node_ptr, layer);
+	let cap_cur = layer_cap(layer);
+	let neighbors_ptr = runner + 4;
+
+	// write new neighbors
+	let w: i32 = 0;
+	for (let i: i32 = 0; i < picked_count && w < cap_cur; i++) {
+		let nid = load<i32>(sel_ids_ptr + <usize>i * 4);
+		if (nid < 0 || nid >= max_elements) continue;
+		if (nid == id) continue;
+
+		// unique
+		let exists = false;
+		for (let j: i32 = 0; j < w; j++) {
+			if (load<i32>(neighbors_ptr + <usize>j * 4) == nid) {
+				exists = true;
+				break;
+			}
+		}
+		if (exists) continue;
+
+		store<i32>(neighbors_ptr + <usize>w * 4, nid);
+		w++;
+	}
+
+	store<i32>(runner, w);
+
+	// clear tail to -1
+	for (let i: i32 = w; i < cap_cur; i++) {
+		store<i32>(neighbors_ptr + <usize>i * 4, -1);
 	}
 }
 
@@ -550,9 +702,8 @@ function add_connection(src: i32, dst: i32, layer: i32): void {
 export function insert(id: i32, vector_data_offset: usize): void {
 	if (id < 0 || id >= max_elements) return;
 
-	// ✅ if exists, behave like update (defensive)
 	if (get_node_ptr(id) != 0) {
-		update_vector(id, vector_data_offset);
+		update_and_reconnect(id, vector_data_offset);
 		return;
 	}
 
@@ -570,6 +721,9 @@ export function insert(id: i32, vector_data_offset: usize): void {
 	for (let l = 0; l <= level; l++) {
 		store<i32>(runner, 0);
 		let cap = l == 0 ? M_MAX0 : M;
+		for (let j: i32 = 0; j < cap; j++) {
+			store<i32>(runner + 4 + <usize>j * 4, -1);
+		}
 		runner += 4 + <usize>cap * 4;
 	}
 
@@ -601,6 +755,7 @@ export function insert(id: i32, vector_data_offset: usize): void {
 
 			for (let i = 0; i < count; i++) {
 				let neighbor = load<i32>(n_ptr + <usize>i * 4);
+				if (neighbor < 0 || neighbor >= max_elements) continue;
 				let d = dist_l2_sq(target_vec_ptr, get_vector_ptr(neighbor));
 				if (d < curr_dist) {
 					curr_dist = d;
@@ -614,15 +769,7 @@ export function insert(id: i32, vector_data_offset: usize): void {
 	for (let l = (level < max_level ? level : max_level); l >= 0; l--) {
 		let target = l == 0 ? M_MAX0 : M;
 
-		let found = search_layer(
-			target_vec_ptr,
-			curr_obj,
-			l,
-			EF_CONSTRUCTION,
-			true,
-			target,
-		);
-
+		let found = search_layer(target_vec_ptr, curr_obj, l, EF_CONSTRUCTION, true, target);
 		let picked = select_neighbors_heuristic(target_vec_ptr, found, target);
 
 		for (let i = 0; i < picked; i++) {
@@ -650,12 +797,116 @@ export function update_vector(id: i32, vector_data_offset: usize): void {
 	memory.copy(target_vec_ptr, vector_data_offset, get_vector_size());
 }
 
+// --- UPDATE + RECONNECT (FIXED: not "only add", we prune & overwrite) ---
+export function update_and_reconnect(id: i32, vector_data_offset: usize): void {
+	if (id < 0 || id >= max_elements) return;
+	let node_ptr = get_node_ptr(id);
+	if (node_ptr == 0) return;
+
+	let target_vec_ptr = get_vector_ptr(id);
+	memory.copy(target_vec_ptr, vector_data_offset, get_vector_size());
+
+	let level = load<i32>(node_ptr + 4);
+	if (level < 0) return;
+	if (level >= MAX_LAYERS) level = MAX_LAYERS - 1;
+
+	if (entry_point_id == -1) return;
+
+	// --- find entry at upper layers (same as insert) ---
+	let curr_obj = entry_point_id;
+	let curr_dist = dist_l2_sq(target_vec_ptr, get_vector_ptr(curr_obj));
+
+	for (let l = max_level; l > level; l--) {
+		let changed = true;
+		while (changed) {
+			changed = false;
+
+			let c_ptr = get_node_ptr(curr_obj);
+			if (c_ptr == 0) break;
+
+			let r_ptr = c_ptr + 8;
+			for (let k = 0; k < l; k++) {
+				let cap = k == 0 ? M_MAX0 : M;
+				r_ptr += 4 + <usize>cap * 4;
+			}
+
+			let count = load<i32>(r_ptr);
+			let n_ptr = r_ptr + 4;
+			for (let i = 0; i < count; i++) {
+				let neighbor = load<i32>(n_ptr + <usize>i * 4);
+				if (neighbor < 0 || neighbor >= max_elements) continue;
+				let d = dist_l2_sq(target_vec_ptr, get_vector_ptr(neighbor));
+				if (d < curr_dist) {
+					curr_dist = d;
+					curr_obj = neighbor;
+					changed = true;
+				}
+			}
+		}
+	}
+
+	// --- for each layer: compute new neighbors and overwrite + clean old reverse edges ---
+	for (let l = (level < max_level ? level : max_level); l >= 0; l--) {
+		let target = l == 0 ? M_MAX0 : M;
+
+		// ✅ FIX: capture old neighbors into dedicated old_ids_ptr (NOT out_ids_ptr)
+		let old_cap = layer_cap(l);
+		let old_ids_count: i32 = 0;
+		{
+			let runner = get_layer_runner_ptr(node_ptr, l);
+			let c = load<i32>(runner);
+			if (c < 0) c = 0;
+			if (c > old_cap) c = old_cap;
+
+			let n_ptr = runner + 4;
+			for (let i: i32 = 0; i < c && i < MAX_EF; i++) {
+				let nid = load<i32>(n_ptr + <usize>i * 4);
+				store<i32>(old_ids_ptr + <usize>i * 4, nid);
+				old_ids_count++;
+			}
+		}
+
+		// compute candidates using construction search
+		let found = search_layer(target_vec_ptr, curr_obj, l, EF_CONSTRUCTION, true, target);
+		let picked = select_neighbors_heuristic(target_vec_ptr, found, target);
+
+		// remove reverse edges from old neighbors that are no longer selected
+		for (let i: i32 = 0; i < old_ids_count; i++) {
+			let oldN = load<i32>(old_ids_ptr + <usize>i * 4);
+			if (oldN < 0 || oldN >= max_elements) continue;
+			if (oldN == id) continue;
+
+			let keep = false;
+			for (let j: i32 = 0; j < picked; j++) {
+				let newN = load<i32>(sel_ids_ptr + <usize>j * 4);
+				if (newN == oldN) {
+					keep = true;
+					break;
+				}
+			}
+			if (!keep) {
+				remove_connection(oldN, id, l);
+			}
+		}
+
+		// overwrite this node's neighbors at this layer
+		overwrite_neighbors(id, l, picked);
+
+		// ensure reverse edges exist for selected neighbors
+		for (let i: i32 = 0; i < picked; i++) {
+			let nid = load<i32>(sel_ids_ptr + <usize>i * 4);
+			if (nid < 0 || nid >= max_elements) continue;
+			if (nid == id) continue;
+			add_connection(nid, id, l);
+		}
+
+		if (found > 0) curr_obj = load<i32>(out_ids_ptr + 0);
+	}
+}
+
 // --- SEARCH API ---
 export function get_results_ptr(): usize {
 	return results_buffer_ptr;
-}
-export function get_results_cap(): i32 {
-	return results_cap;
 }
 
 export function search(query_vec_offset: usize, k: i32): i32 {
@@ -670,6 +921,8 @@ export function search(query_vec_offset: usize, k: i32): i32 {
 		while (changed) {
 			changed = false;
 			let c_ptr = get_node_ptr(curr_obj);
+			if (c_ptr == 0) break;
+
 			let r_ptr = c_ptr + 8;
 			for (let kk = 0; kk < l; kk++) {
 				let cap = kk == 0 ? M_MAX0 : M;
@@ -680,6 +933,7 @@ export function search(query_vec_offset: usize, k: i32): i32 {
 
 			for (let i = 0; i < count; i++) {
 				let neighbor = load<i32>(n_ptr + <usize>i * 4);
+				if (neighbor < 0 || neighbor >= max_elements) continue;
 				let d = dist_l2_sq(query_vec_offset, get_vector_ptr(neighbor));
 				if (d < curr_dist) {
 					curr_dist = d;
@@ -692,12 +946,17 @@ export function search(query_vec_offset: usize, k: i32): i32 {
 
 	let ef = EF_SEARCH;
 	if (ef < k) ef = k;
-	if (ef > MAX_EF) ef = MAX_EF;
+	if (ef > MAX_EF) {
+		ef = MAX_EF;
+		ef_clamped_flag = 1;
+	}
 
 	let found = search_layer(query_vec_offset, curr_obj, 0, ef, false, 0);
 
+	// ✅ clamp to fixed buffer capacity & logical cap
 	let out_count = found < k ? found : k;
 	if (out_count > results_cap) out_count = results_cap;
+	if (out_count > MAX_EF) out_count = MAX_EF;
 
 	for (let i = 0; i < out_count; i++) {
 		let id = load<i32>(out_ids_ptr + <usize>i * 4);
@@ -710,32 +969,15 @@ export function search(query_vec_offset: usize, k: i32): i32 {
 }
 
 /* ------------------------------
-   ✅ Dump V2 (sparse-id safe)
+   ✅ Dump V3 (sparse-id safe + M_MAX0 in header)
 --------------------------------*/
 
 const MAGIC_HNSW: i32 = 0x57534e48; // "HNSW"
-const DUMP_VERSION_V2: i32 = 2;
+const DUMP_VERSION_V3: i32 = 3;
 
-/**
- * V2 layout:
- * header:
- *  magic(i32)
- *  version(i32)=2
- *  DIM(i32) M(i32) EF_CONSTRUCTION(i32) MAX_LAYERS(i32)
- *  max_elements(i32)
- *  present_count(i32)
- *  entry_point_id(i32)
- *  max_level(i32)
- *  results_cap(i32)
- *
- * then for each present node:
- *  id(i32)
- *  level(i32)
- *  vector[DIM] bytes (int8)
- *  for l=0..level:
- *    count(i32)
- *    neighbors[cap] i32 (cap is M_MAX0 for l=0 else M)  (full cap stored)
- */
+// ✅ header size is 12 i32 fields = 48 bytes
+const HEADER_I32S: usize = 12;
+const HEADER_BYTES: usize = HEADER_I32S * 4;
 
 function count_present_nodes(): i32 {
 	let n: i32 = 0;
@@ -749,10 +991,9 @@ export function get_index_dump_size(): usize {
 	let present = count_present_nodes();
 	let size: usize = 0;
 
-	// header (10 i32) = 40 bytes
-	size += 40;
+	// ✅ header (12 i32) = 48 bytes
+	size += HEADER_BYTES;
 
-	// per node size
 	for (let i: i32 = 0; i < max_elements; i++) {
 		let node_ptr = get_node_ptr(i);
 		if (node_ptr == 0) continue;
@@ -770,8 +1011,6 @@ export function get_index_dump_size(): usize {
 		}
 	}
 
-	// present_count is element_count ideally, but use scan to be safe
-	// (size already computed via scan)
 	return size;
 }
 
@@ -781,10 +1020,11 @@ export function save_index(ptr: usize): usize {
 	let present = count_present_nodes();
 
 	store<i32>(ptr + off, MAGIC_HNSW); off += 4;
-	store<i32>(ptr + off, DUMP_VERSION_V2); off += 4;
+	store<i32>(ptr + off, DUMP_VERSION_V3); off += 4;
 
 	store<i32>(ptr + off, DIM); off += 4;
 	store<i32>(ptr + off, M); off += 4;
+	store<i32>(ptr + off, M_MAX0); off += 4;
 	store<i32>(ptr + off, EF_CONSTRUCTION); off += 4;
 	store<i32>(ptr + off, MAX_LAYERS); off += 4;
 
@@ -792,9 +1032,10 @@ export function save_index(ptr: usize): usize {
 	store<i32>(ptr + off, present); off += 4;
 	store<i32>(ptr + off, entry_point_id); off += 4;
 	store<i32>(ptr + off, max_level); off += 4;
+
+	// ✅ results_cap is now always <= MAX_EF, still persisted for host convenience
 	store<i32>(ptr + off, results_cap); off += 4;
 
-	// nodes
 	for (let i: i32 = 0; i < max_elements; i++) {
 		let node_ptr = get_node_ptr(i);
 		if (node_ptr == 0) continue;
@@ -805,12 +1046,10 @@ export function save_index(ptr: usize): usize {
 		store<i32>(ptr + off, id); off += 4;
 		store<i32>(ptr + off, level); off += 4;
 
-		// vector bytes
 		let vptr = get_vector_ptr(id);
 		memory.copy(ptr + off, vptr, get_vector_size());
 		off += get_vector_size();
 
-		// neighbors
 		let runner = node_ptr + 8;
 		for (let l: i32 = 0; l <= level; l++) {
 			let cap = l == 0 ? M_MAX0 : M;
@@ -829,23 +1068,19 @@ export function save_index(ptr: usize): usize {
 	return off;
 }
 
-/**
- * ✅ load_index returns i32 status:
- *  1 = success
- *  0 = failure (magic/version/config mismatch or corrupt)
- */
 export function load_index(ptr: usize, size: usize): i32 {
 	let off: usize = 0;
-	if (size < 40) return 0;
+	if (size < HEADER_BYTES) return 0;
 
 	let magic = load<i32>(ptr + off); off += 4;
 	if (magic != MAGIC_HNSW) return 0;
 
 	let ver = load<i32>(ptr + off); off += 4;
-	if (ver != DUMP_VERSION_V2) return 0;
+	if (ver != DUMP_VERSION_V3) return 0;
 
 	let dump_dim = load<i32>(ptr + off); off += 4;
 	let dump_m = load<i32>(ptr + off); off += 4;
+	let dump_mmax0 = load<i32>(ptr + off); off += 4;
 	let dump_ef = load<i32>(ptr + off); off += 4;
 	let dump_layers = load<i32>(ptr + off); off += 4;
 
@@ -858,6 +1093,7 @@ export function load_index(ptr: usize, size: usize): i32 {
 	if (
 		dump_dim != DIM ||
 		dump_m != M ||
+		dump_mmax0 != M_MAX0 ||
 		dump_ef != EF_CONSTRUCTION ||
 		dump_layers != MAX_LAYERS
 	) {
@@ -866,9 +1102,10 @@ export function load_index(ptr: usize, size: usize): i32 {
 	if (dump_max_elements <= 0) return 0;
 	if (dump_present < 0) return 0;
 
-	// use dump_results_cap to size results buffer if host didn't set it
+	// ✅ results_cap persisted but clamped
 	if (dump_results_cap > 0) {
 		results_cap = dump_results_cap;
+		if (results_cap > MAX_EF) results_cap = MAX_EF;
 	}
 
 	init_index(dump_max_elements);
@@ -879,7 +1116,6 @@ export function load_index(ptr: usize, size: usize): i32 {
 	let loaded_count: i32 = 0;
 
 	for (let n: i32 = 0; n < dump_present; n++) {
-		// bounds check minimal
 		if (off + 8 > size) return 0;
 
 		let id = load<i32>(ptr + off); off += 4;
@@ -888,7 +1124,6 @@ export function load_index(ptr: usize, size: usize): i32 {
 		if (id < 0 || id >= max_elements) return 0;
 		if (level < 0 || level >= MAX_LAYERS) return 0;
 
-		// vector bytes
 		if (off + get_vector_size() > size) return 0;
 		memory.copy(get_vector_ptr(id), ptr + off, get_vector_size());
 		off += get_vector_size();
@@ -906,10 +1141,21 @@ export function load_index(ptr: usize, size: usize): i32 {
 
 			let count = load<i32>(ptr + off);
 			off += 4;
+
+			if (count < 0 || count > cap) return 0;
+
 			store<i32>(runner, count);
 
 			memory.copy(runner + 4, ptr + off, <usize>cap * 4);
 			off += <usize>cap * 4;
+
+			let neighbors_ptr = runner + 4;
+			for (let i: i32 = 0; i < cap; i++) {
+				let nid = load<i32>(neighbors_ptr + <usize>i * 4);
+				if (nid < 0 || nid >= max_elements) {
+					store<i32>(neighbors_ptr + <usize>i * 4, -1);
+				}
+			}
 
 			runner += 4 + <usize>cap * 4;
 		}
@@ -920,7 +1166,6 @@ export function load_index(ptr: usize, size: usize): i32 {
 
 	element_count = loaded_count;
 
-	// if entry point invalid, degrade to empty
 	if (entry_point_id != -1 && get_node_ptr(entry_point_id) == 0) {
 		entry_point_id = -1;
 		max_level = -1;

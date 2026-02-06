@@ -11,6 +11,7 @@ import {
 	init_index,
 	insert,
 	update_vector,
+	update_and_reconnect,
 	search,
 	get_results_ptr,
 	get_results_cap,
@@ -20,6 +21,10 @@ import {
 	has_node,
 	seed_rng,
 	set_results_cap,
+	get_max_ef,
+	was_ef_clamped,
+	clear_ef_clamped,
+	get_max_elements,
 } from "./hnsw";
 
 import { dist_l2_sq, dist_dot } from "./math";
@@ -38,14 +43,19 @@ export { init_memory, alloc, get_memory_usage, set_memory_usage, reset_memory };
 export {
 	set_results_cap,
 	get_results_cap,
+	get_max_elements,
+	get_max_ef,
+	was_ef_clamped,
+	clear_ef_clamped,
 	init_index,
 	insert,
 	update_vector,
+	update_and_reconnect,
 	has_node,
 	search,
 	get_results_ptr,
 	save_index,
-	load_index, // now returns i32
+	load_index,
 	get_index_dump_size,
 	seed_rng,
 };

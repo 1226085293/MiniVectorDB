@@ -19,12 +19,12 @@ export class WasmBridge {
 		resultsCap?: number;
 	} | null = null;
 
-	// ✅ Reusable scratch buffer inside WASM linear memory (Int8)
 	private scratchI8Ptr: number = 0;
 	private scratchI8Cap: number = 0;
 
-	// ✅ serialize all wasm interactions (future-proof)
 	private lock: Promise<void> = Promise.resolve();
+
+	private wasmMaxEf: number = 0;
 
 	private async withLock<T>(fn: () => T | Promise<T>): Promise<T> {
 		let release!: () => void;
@@ -66,6 +66,13 @@ export class WasmBridge {
 		await this.withLock(async () => {
 			this.wasmModule.init_memory();
 
+			// read wasm max ef early
+			if (typeof this.wasmModule.get_max_ef === "function") {
+				this.wasmMaxEf = Number(this.wasmModule.get_max_ef()) | 0;
+			} else {
+				this.wasmMaxEf = 0;
+			}
+
 			if (config) {
 				this.currentConfig = config;
 				this.wasmModule.set_config(config.dim, config.m, config.ef);
@@ -77,13 +84,12 @@ export class WasmBridge {
 					this.wasmModule.set_search_config(config.efSearch);
 				}
 
-				// ✅ results cap
 				if (typeof this.wasmModule.set_results_cap === "function") {
-					this.wasmModule.set_results_cap(config.resultsCap ?? 1000);
+					const cap = this.clampResultsCap(config.resultsCap ?? 1000);
+					this.wasmModule.set_results_cap(cap);
 				}
 			}
 
-			// ✅ seed RNG in wasm (deterministic if provided)
 			if (typeof this.wasmModule.seed_rng === "function") {
 				const seedFromEnv = process.env.HNSW_SEED
 					? Number(process.env.HNSW_SEED) >>> 0
@@ -100,7 +106,6 @@ export class WasmBridge {
 			const cap = config?.capacity ?? 10000;
 			this.wasmModule.init_index(cap);
 
-			// ✅ allocate scratch once (size = dim bytes, for Int8 vectors)
 			if (config?.dim) {
 				this.ensureScratchI8(config.dim);
 			}
@@ -109,6 +114,23 @@ export class WasmBridge {
 				"WASM Initialized. Memory size:",
 				this.memory.buffer.byteLength,
 			);
+		});
+	}
+
+	private clampResultsCap(cap: number): number {
+		if (!cap || cap <= 0) return 1;
+		if (this.wasmMaxEf > 0) return Math.min(cap | 0, this.wasmMaxEf);
+		return cap | 0;
+	}
+
+	async getMaxEf(): Promise<number> {
+		return this.withLock(() => {
+			if (this.wasmMaxEf > 0) return this.wasmMaxEf;
+			if (typeof this.wasmModule?.get_max_ef === "function") {
+				this.wasmMaxEf = Number(this.wasmModule.get_max_ef()) | 0;
+				return this.wasmMaxEf;
+			}
+			return 0;
 		});
 	}
 
@@ -133,6 +155,33 @@ export class WasmBridge {
 		return this.scratchI8Ptr;
 	}
 
+	async getResultsCap(): Promise<number> {
+		return this.withLock(() => {
+			if (typeof this.wasmModule.get_results_cap === "function") {
+				return Number(this.wasmModule.get_results_cap());
+			}
+			return 0;
+		});
+	}
+
+	async setResultsCap(cap: number): Promise<void> {
+		await this.withLock(() => {
+			if (typeof this.wasmModule.set_results_cap === "function") {
+				this.wasmModule.set_results_cap(this.clampResultsCap(cap));
+			}
+		});
+	}
+
+	async getMaxElements(): Promise<number> {
+		return this.withLock(() => {
+			if (typeof this.wasmModule.get_max_elements === "function") {
+				return Number(this.wasmModule.get_max_elements());
+			}
+			// fallback to config if wasm export missing
+			return Number(this.currentConfig?.capacity ?? 0);
+		});
+	}
+
 	async hasNode(id: number): Promise<boolean> {
 		return this.withLock(() => {
 			if (typeof this.wasmModule.has_node === "function")
@@ -151,6 +200,12 @@ export class WasmBridge {
 	async updateVector(id: number, vectorI8: Int8Array): Promise<void> {
 		await this.withLock(() => {
 			const ptr = this.writeVectorI8Reusable(vectorI8);
+
+			if (typeof this.wasmModule.update_and_reconnect === "function") {
+				this.wasmModule.update_and_reconnect(id, ptr);
+				return;
+			}
+
 			this.wasmModule.update_vector(id, ptr);
 		});
 	}
@@ -200,16 +255,19 @@ export class WasmBridge {
 
 			const buf = await fs.promises.readFile(filePath);
 
-			// reset allocator (bump pointer) -> all old pointers invalid
 			if (typeof this.wasmModule.reset_memory === "function") {
 				this.wasmModule.reset_memory();
 			} else {
 				this.wasmModule.init_memory();
 			}
 
-			// scratch becomes invalid
 			this.scratchI8Ptr = 0;
 			this.scratchI8Cap = 0;
+
+			// refresh max ef (module re-init)
+			if (typeof this.wasmModule.get_max_ef === "function") {
+				this.wasmMaxEf = Number(this.wasmModule.get_max_ef()) | 0;
+			}
 
 			if (this.currentConfig) {
 				this.wasmModule.set_config(
@@ -227,12 +285,11 @@ export class WasmBridge {
 
 				if (typeof this.wasmModule.set_results_cap === "function") {
 					this.wasmModule.set_results_cap(
-						this.currentConfig.resultsCap ?? 1000,
+						this.clampResultsCap(this.currentConfig.resultsCap ?? 1000),
 					);
 				}
 			}
 
-			// reseed after reset
 			if (typeof this.wasmModule.seed_rng === "function") {
 				const seedFromEnv = process.env.HNSW_SEED
 					? Number(process.env.HNSW_SEED) >>> 0
@@ -246,7 +303,6 @@ export class WasmBridge {
 				this.wasmModule.seed_rng(seed);
 			}
 
-			// load dump
 			const ptr = this.wasmModule.alloc(buf.length);
 			new Uint8Array(this.memory.buffer, ptr, buf.length).set(buf);
 
@@ -257,7 +313,6 @@ export class WasmBridge {
 				);
 			}
 
-			// re-create scratch
 			if (this.currentConfig?.dim) {
 				this.ensureScratchI8(this.currentConfig.dim);
 			}

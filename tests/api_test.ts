@@ -7,6 +7,10 @@ import net from "net";
 // 加载本地 .env 配置
 dotenv.config({ path: path.join(__dirname, "../.env") });
 
+function delay(ms: number) {
+	return new Promise((r) => setTimeout(r, ms));
+}
+
 // 获取随机可用端口
 function getAvailablePort(): Promise<number> {
 	return new Promise((resolve, reject) => {
@@ -17,6 +21,36 @@ function getAvailablePort(): Promise<number> {
 		});
 		server.on("error", reject);
 	});
+}
+
+// Windows 下必须杀进程树（npx/ts-node 经常还有子进程）
+async function killProcessTree(pid: number) {
+	if (!pid) return;
+
+	if (process.platform === "win32") {
+		spawn("taskkill", ["/PID", String(pid), "/T", "/F"], {
+			stdio: "ignore",
+			shell: true,
+		});
+		return;
+	}
+
+	try {
+		process.kill(pid, "SIGTERM");
+	} catch {}
+	await delay(200);
+	try {
+		process.kill(pid, "SIGKILL");
+	} catch {}
+}
+
+async function waitExitOrKill(proc: any, timeoutMs: number) {
+	const start = Date.now();
+	while (Date.now() - start < timeoutMs) {
+		if (proc.exitCode !== null) return;
+		await delay(50);
+	}
+	await killProcessTree(proc.pid ?? 0);
 }
 
 async function main() {
@@ -35,19 +69,21 @@ async function main() {
 		env: {
 			...process.env,
 			API_PORT: TEST_PORT.toString(),
+			API_HOST: "127.0.0.1",
+			NODE_ENV: "test",
 		},
 	});
 
-	let serverUrl = `http://localhost:${TEST_PORT}`;
+	const serverUrl = `http://localhost:${TEST_PORT}`;
 	let outputBuffer = "";
 
-	serverProcess.stdout.on("data", (data) => {
+	serverProcess.stdout?.on("data", (data: Buffer) => {
 		const msg = data.toString();
 		outputBuffer += msg;
 		console.log("[SERVER OUT]", msg.trim());
 	});
 
-	serverProcess.stderr.on("data", (data) => {
+	serverProcess.stderr?.on("data", (data: Buffer) => {
 		const msg = data.toString();
 		outputBuffer += msg;
 		console.error("[SERVER ERR]", msg.trim());
@@ -63,10 +99,14 @@ async function main() {
 			}
 		};
 
-		serverProcess.stdout.on("data", (data) => checkOutput(data.toString()));
-		serverProcess.stderr.on("data", (data) => checkOutput(data.toString()));
+		serverProcess.stdout?.on("data", (data: Buffer) =>
+			checkOutput(data.toString()),
+		);
+		serverProcess.stderr?.on("data", (data: Buffer) =>
+			checkOutput(data.toString()),
+		);
 
-		serverProcess.on("exit", (code) => {
+		serverProcess.on("exit", (code: number) => {
 			if (!isReady) {
 				console.error(`Server process exited with code ${code}`);
 				resolve(false);
@@ -85,7 +125,7 @@ async function main() {
 		console.error("\n--- Server Output ---");
 		console.error(outputBuffer);
 		console.error("---------------------\n");
-		serverProcess.kill();
+		await killProcessTree(serverProcess.pid ?? 0);
 		process.exit(1);
 	}
 
@@ -104,7 +144,7 @@ async function main() {
 		});
 
 		if (insertResp.status !== 200) {
-			const errData = await insertResp.json();
+			const errData = await insertResp.json().catch(() => ({}));
 			console.error("Insert failed:", errData);
 			throw new Error("API Insert Failed");
 		}
@@ -115,6 +155,7 @@ async function main() {
 			headers: { "Content-Type": "application/json" },
 			body: JSON.stringify({ vector: new Array(vectorDim).fill(0.1), k: 1 }),
 		});
+
 		const searchData: any = await searchResp.json();
 
 		if (searchData.results && searchData.results[0]?.id === "api-test-1") {
@@ -125,12 +166,17 @@ async function main() {
 		}
 	} catch (e) {
 		console.error("❌ API TEST FAILED:", e);
-		process.exit(1);
+		process.exitCode = 1;
 	} finally {
-		await fetch(`${serverUrl}/shutdown`, { method: "POST" });
-		await new Promise((resolve) => serverProcess.on("exit", resolve));
+		// ✅ 先请求 shutdown（忽略错误）
+		try {
+			await fetch(`${serverUrl}/shutdown`, { method: "POST" });
+		} catch {}
 
-		process.exit(0);
+		// ✅ 限时等待 server 退出，超时就杀树（否则 test 永远挂着）
+		await waitExitOrKill(serverProcess, 8000);
+
+		process.exit(process.exitCode ?? 0);
 	}
 }
 
