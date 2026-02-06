@@ -55,7 +55,7 @@ async function start() {
 		if (!id || !vector || vector.length !== db.config.dim) {
 			return reply
 				.code(400)
-				.send({ error: "Invalid input. Vector must be 128 dim." });
+				.send({ error: `Invalid input. Vector must be ${db.config.dim} dim.` });
 		}
 
 		await db.insert({ id, vector, metadata });
@@ -67,7 +67,9 @@ async function start() {
 		const { vector, k = 10, filter } = request.body;
 
 		if (!vector || vector.length !== db.config.dim) {
-			return reply.code(400).send({ error: "Invalid vector" });
+			return reply
+				.code(400)
+				.send({ error: `Invalid vector must be ${db.config.dim} dim.` });
 		}
 
 		const f32Vec = new Float32Array(vector);
@@ -93,6 +95,12 @@ async function start() {
 	// 4. Stats
 	server.get("/stats", async () => {
 		return db.getStats();
+	});
+
+	server.post("/shutdown", async () => {
+		await db.close();
+		server.close();
+		return { status: "shutting down" };
 	});
 
 	// Start

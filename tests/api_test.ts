@@ -7,10 +7,22 @@ import net from "net";
 // 加载本地 .env 配置
 dotenv.config({ path: path.join(__dirname, "../.env") });
 
+// 获取随机可用端口
+function getAvailablePort(): Promise<number> {
+	return new Promise((resolve, reject) => {
+		const server = net.createServer();
+		server.listen(0, "127.0.0.1", () => {
+			const port = (server.address() as net.AddressInfo).port;
+			server.close(() => resolve(port));
+		});
+		server.on("error", reject);
+	});
+}
+
 async function main() {
 	console.log("--- API TEST START ---");
 
-	const TEST_PORT = process.env.API_PORT || "3000";
+	const TEST_PORT = await getAvailablePort();
 	console.log(`Using port: ${TEST_PORT}`);
 	console.log(`Using VECTOR_DIM: ${process.env.VECTOR_DIM || "384 (default)"}`);
 
@@ -22,7 +34,7 @@ async function main() {
 		shell: true,
 		env: {
 			...process.env,
-			PORT: TEST_PORT.toString(),
+			API_PORT: TEST_PORT.toString(),
 		},
 	});
 
@@ -115,12 +127,10 @@ async function main() {
 		console.error("❌ API TEST FAILED:", e);
 		process.exit(1);
 	} finally {
-		serverProcess.kill();
-		if (process.platform === "win32" && serverProcess.pid) {
-			try {
-				spawn("taskkill", ["/pid", serverProcess.pid.toString(), "/f", "/t"]);
-			} catch {}
-		}
+		await fetch(`${serverUrl}/shutdown`, { method: "POST" });
+		await new Promise((resolve) => serverProcess.on("exit", resolve));
+
+		process.exit(0);
 	}
 }
 
