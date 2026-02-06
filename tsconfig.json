@@ -1,6 +1,16 @@
-{"compilerOptions":{"target":"es2019","module":"commonjs","lib":["es2022", "dom"],"strict":true,"esModuleInterop":true,"skipLibCheck":true,"forceConsistentCasingInFileNames":true,"moduleResolution":"node",
-    "outDir": "./dist",
-    "declaration": true
-  },
-  "include": ["src/**/*"],
-  "exclude": ["node_modules", "tests", "dist"]}
+{
+	"compilerOptions": {
+		"target": "es2019",
+		"module": "commonjs",
+		"lib": ["es2022", "dom"],
+		"strict": true,
+		"esModuleInterop": true,
+		"skipLibCheck": true,
+		"forceConsistentCasingInFileNames": true,
+		"moduleResolution": "node",
+		"outDir": "./dist",
+		"declaration": true
+	},
+	"include": ["src/**/*"],
+	"exclude": ["node_modules", "tests", "dist", "assembly", "build"]
+}

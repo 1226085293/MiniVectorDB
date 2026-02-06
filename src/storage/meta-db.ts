@@ -14,23 +14,27 @@ export class MetaDB {
 	private db: Loki;
 	private dbPath: string;
 
+	private bulkDepth = 0;
+	private autosaveWasEnabled = true;
+
 	constructor(
 		dbPath: string = path.join(__dirname, "../../data/metadata.json"),
 	) {
 		this.dbPath = dbPath;
 
-		// Ensure directory exists
 		const dir = path.dirname(dbPath);
 		if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
 
-		// 不用 autoload
 		this.db = new Loki(dbPath, {
 			autosave: true,
 			autosaveInterval: 4000,
 		});
 	}
 
-	// 初始化 collection
+	getPath(): string {
+		return this.dbPath;
+	}
+
 	private initCollection() {
 		let items = this.db.getCollection<Item>("items");
 		if (!items) {
@@ -41,7 +45,6 @@ export class MetaDB {
 		this.items = items;
 	}
 
-	// 异步加载数据库
 	async ready(): Promise<void> {
 		return new Promise((resolve, reject) => {
 			this.db.loadDatabase({}, (err) => {
@@ -50,6 +53,48 @@ export class MetaDB {
 				resolve();
 			});
 		});
+	}
+
+	/**
+	 * Bulk mode:
+	 * - disables autosave during massive insert/update
+	 * - endBulk will do a single saveDatabase()
+	 */
+	beginBulk(): void {
+		this.bulkDepth++;
+		if (this.bulkDepth === 1) {
+			// Loki stores autosave state internally; we treat current config as enabled if autosave exists.
+			this.autosaveWasEnabled = true;
+			try {
+				// @ts-ignore
+				this.db.autosaveDisable();
+			} catch {
+				// ignore
+			}
+		}
+	}
+
+	async endBulk(): Promise<void> {
+		if (this.bulkDepth <= 0) return;
+		this.bulkDepth--;
+		if (this.bulkDepth === 0) {
+			// single flush
+			await new Promise<void>((resolve, reject) => {
+				this.db.saveDatabase((err) => {
+					if (err) return reject(err);
+					resolve();
+				});
+			});
+
+			if (this.autosaveWasEnabled) {
+				try {
+					// @ts-ignore
+					this.db.autosaveEnable();
+				} catch {
+					// ignore
+				}
+			}
+		}
 	}
 
 	add(externalId: string, internalId: number, metadata: any) {

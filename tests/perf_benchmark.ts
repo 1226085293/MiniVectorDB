@@ -1,25 +1,4 @@
 // tests/perf_benchmark.ts
-/**
- * 性能基准测试（固定 N=100000）：
- * - 插入耗时
- * - 搜索吞吐与延迟
- * - save/load 耗时
- * - 内存占用（Node RSS/heap/external/arrayBuffers）+ 文件大小（vectors/meta/dump）
- *
- * 运行：
- *   npx ts-node tests/perf_benchmark.ts
- *
- * 建议（可选）：
- *   node --expose-gc node_modules/.bin/ts-node tests/perf_benchmark.ts
- *
- * 可选环境变量（仍可调参）：
- *   PERF_DIM=384
- *   PERF_K=10
- *   PERF_QUERIES=200
- *   PERF_BATCH=500
- *   PERF_REPORT=1
- */
-
 import fs from "fs";
 import path from "path";
 import os from "os";
@@ -73,7 +52,6 @@ function safeStatSize(file?: string | null): number {
 	}
 }
 
-// 稳定可复现实验向量
 function genVec(dim: number, seed: number): Float32Array {
 	const v = new Float32Array(dim);
 	let x = seed | 0;
@@ -123,10 +101,7 @@ async function main() {
 	const dim = parseInt(process.env.PERF_DIM || "384", 10);
 	const k = parseInt(process.env.PERF_K || "10", 10);
 	const queryCount = parseInt(process.env.PERF_QUERIES || "200", 10);
-
-	// Windows 上 batch 并发过大容易抖动，默认保守一些
 	const batch = parseInt(process.env.PERF_BATCH || "500", 10);
-
 	const report = process.env.PERF_REPORT === "1";
 
 	console.log("========================================");
@@ -153,7 +128,6 @@ async function main() {
 	const metaPath = path.join(caseDir, "metadata.json");
 	const vecPath = path.join(caseDir, "vectors.f32.bin");
 
-	// capacity 必须 >= N（建议留 buffer）
 	const capacity = Math.floor(N * 1.1);
 
 	const db = new MiniVectorDB({
@@ -162,6 +136,8 @@ async function main() {
 		vectorStorePath: vecPath,
 		rerankMultiplier: 30,
 		capacity,
+		// ✅建议 benchmark 打开：查询 rerank 的随机小读会变稳
+		preloadVectors: true,
 	});
 
 	const initRes = await stage("init()", async () => {
@@ -169,26 +145,20 @@ async function main() {
 		return true;
 	});
 
-	let inserted = 0;
 	const insRes = await stage(
-		`insert(${N})`,
+		`insertMany(${N})`,
 		async () => {
+			let inserted = 0;
 			while (inserted < N) {
 				const end = Math.min(N, inserted + batch);
 
-				// 更稳定的 benchmark：小并发即可
-				const tasks: Promise<void>[] = [];
+				const items = [];
 				for (let i = inserted; i < end; i++) {
 					const v = genVec(dim, i + 1);
-					tasks.push(
-						db.insert({
-							id: `doc-${i}`,
-							vector: v,
-							metadata: { i },
-						}),
-					);
+					items.push({ id: `doc-${i}`, vector: v, metadata: { i } });
 				}
-				await Promise.all(tasks);
+
+				await db.insertMany(items);
 				inserted = end;
 
 				if (inserted % (batch * 10) === 0 || inserted === N) {
@@ -203,9 +173,6 @@ async function main() {
 		{ batch },
 	);
 
-	// ✅ 关键修复：metaFile 不再用“猜路径”
-	// - 以 db.getStats() 返回的 metaPath 为准
-	// - vecPath / dumpPath 仍由测试脚本确定
 	const statsAfterInsert: any = db.getStats();
 	const realMetaPath: string =
 		statsAfterInsert.metaPath || statsAfterInsert.metaDbPath || metaPath;
@@ -264,13 +231,13 @@ async function main() {
 		return true;
 	});
 
-	// reload instance
 	const db2 = new MiniVectorDB({
 		dim,
 		metaDbPath: metaPath,
 		vectorStorePath: vecPath,
 		rerankMultiplier: 30,
 		capacity,
+		preloadVectors: true,
 	});
 
 	const init2Res = await stage("init() [reload instance]", async () => {

@@ -1,4 +1,3 @@
-// assembly/pqueue.ts
 // Heap-based candidate queues for HNSW (GC-minimal, stable performance)
 
 export class MinHeap {

@@ -1,4 +1,3 @@
-// assembly/types.ts
 // Data Structures Layout
 
 import { DIM, M, M_MAX0 } from "./config";

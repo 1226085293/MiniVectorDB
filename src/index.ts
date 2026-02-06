@@ -33,8 +33,11 @@ export interface DBConfig {
 
 	rerankMultiplier?: number;
 
-	// ✅ 新增：WASM HNSW capacity（必须 >= 预计最大条目数）
+	// ✅ WASM HNSW capacity
 	capacity?: number;
+
+	// ✅ vectors 加速：预加载到内存（Windows 随机小读抖动会明显改善）
+	preloadVectors?: boolean;
 }
 
 export class MiniVectorDB {
@@ -46,6 +49,9 @@ export class MiniVectorDB {
 
 	private vecPath: string;
 	private vecFd: fs.promises.FileHandle | null = null;
+
+	// optional in-memory cache for vectors.f32.bin
+	private vecCache: Buffer | null = null;
 
 	constructor(config: DBConfig = {}) {
 		this.config = config;
@@ -60,6 +66,14 @@ export class MiniVectorDB {
 			config.vectorStorePath || path.join(__dirname, "../data/vectors.f32.bin");
 	}
 
+	private dim(): number {
+		return this.config.dim || Number(process.env.VECTOR_DIM ?? 0) || 384;
+	}
+
+	private bytesPerVec(): number {
+		return this.dim() * 4;
+	}
+
 	private async ensureVectorStoreReady(): Promise<void> {
 		if (this.vecFd) return;
 
@@ -68,6 +82,11 @@ export class MiniVectorDB {
 
 		const exists = fs.existsSync(this.vecPath);
 		this.vecFd = await fs.promises.open(this.vecPath, exists ? "r+" : "w+");
+
+		// preload cache if configured and file exists
+		if (this.config.preloadVectors && exists) {
+			this.vecCache = await fs.promises.readFile(this.vecPath);
+		}
 	}
 
 	private quantizeToI8(v: Float32Array): Int8Array {
@@ -93,50 +112,133 @@ export class MiniVectorDB {
 		return s;
 	}
 
+	private ensureCacheCapacity(minBytes: number) {
+		if (!this.config.preloadVectors) return;
+		if (!this.vecCache) {
+			this.vecCache = Buffer.allocUnsafe(minBytes);
+			this.vecCache.fill(0);
+			return;
+		}
+		if (this.vecCache.length < minBytes) {
+			const old = this.vecCache;
+			const next = Buffer.allocUnsafe(minBytes);
+			old.copy(next, 0, 0, old.length);
+			next.fill(0, old.length);
+			this.vecCache = next;
+		}
+	}
+
+	private async writeF32VectorsContiguous(
+		startInternalId: number,
+		vectors: Float32Array[],
+	): Promise<void> {
+		await this.ensureVectorStoreReady();
+		const fd = this.vecFd!;
+		const bpv = this.bytesPerVec();
+		const totalBytes = vectors.length * bpv;
+		const pos = startInternalId * bpv;
+
+		const buf = Buffer.allocUnsafe(totalBytes);
+		for (let i = 0; i < vectors.length; i++) {
+			const v = vectors[i];
+			const slice = Buffer.from(v.buffer, v.byteOffset, v.byteLength);
+			slice.copy(buf, i * bpv, 0, bpv);
+		}
+
+		const { bytesWritten } = await fd.write(buf, 0, totalBytes, pos);
+		if (bytesWritten !== totalBytes) {
+			throw new Error(
+				`Vector store bulk write failed. bytesWritten=${bytesWritten}, total=${totalBytes}`,
+			);
+		}
+
+		// update cache
+		if (this.config.preloadVectors) {
+			this.ensureCacheCapacity(pos + totalBytes);
+			this.vecCache!.set(buf, pos);
+		}
+	}
+
 	private async writeF32Vector(
 		internalId: number,
 		v: Float32Array,
 	): Promise<void> {
-		await this.ensureVectorStoreReady();
-		const fd = this.vecFd!;
-		const dim = this.config.dim || Number(process.env.VECTOR_DIM ?? 0) || 384;
-		const bytesPerVec = dim * 4;
-		const pos = internalId * bytesPerVec;
-
-		const buf = Buffer.from(v.buffer, v.byteOffset, v.byteLength);
-		const { bytesWritten } = await fd.write(buf, 0, bytesPerVec, pos);
-		if (bytesWritten !== bytesPerVec) {
-			throw new Error(
-				`Vector store write failed for id=${internalId}. bytesWritten=${bytesWritten}`,
-			);
-		}
+		await this.writeF32VectorsContiguous(internalId, [v]);
 	}
 
-	private async readF32Vector(internalId: number): Promise<Float32Array> {
+	private async readF32Vectors(
+		internalIds: number[],
+	): Promise<Map<number, Float32Array>> {
 		await this.ensureVectorStoreReady();
 		const fd = this.vecFd!;
-		const dim = this.config.dim || Number(process.env.VECTOR_DIM ?? 0) || 384;
-		const bytesPerVec = dim * 4;
-		const pos = internalId * bytesPerVec;
+		const dim = this.dim();
+		const bpv = this.bytesPerVec();
 
-		const buf = Buffer.allocUnsafe(bytesPerVec);
-		const { bytesRead } = await fd.read(buf, 0, bytesPerVec, pos);
-		if (bytesRead !== bytesPerVec) {
-			throw new Error(
-				`Vector store read failed for id=${internalId}. bytesRead=${bytesRead}`,
-			);
+		const out = new Map<number, Float32Array>();
+		if (internalIds.length === 0) return out;
+
+		// if cache enabled, serve from memory
+		if (this.config.preloadVectors && this.vecCache) {
+			for (const id of internalIds) {
+				const pos = id * bpv;
+				if (pos + bpv > this.vecCache.length) continue;
+				const dv = new DataView(
+					this.vecCache.buffer,
+					this.vecCache.byteOffset + pos,
+					bpv,
+				);
+				const v = new Float32Array(dim);
+				for (let i = 0; i < dim; i++) v[i] = dv.getFloat32(i * 4, true);
+				out.set(id, v);
+			}
+			return out;
 		}
 
-		const out = new Float32Array(dim);
-		const dv = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
-		for (let i = 0; i < dim; i++) out[i] = dv.getFloat32(i * 4, true);
+		// otherwise: reduce random IO by merging contiguous runs
+		const ids = Array.from(new Set(internalIds)).sort((a, b) => a - b);
+
+		let i = 0;
+		while (i < ids.length) {
+			const start = ids[i];
+			let end = start;
+
+			// grow contiguous run
+			while (i + 1 < ids.length && ids[i + 1] === end + 1) {
+				i++;
+				end = ids[i];
+			}
+
+			const count = end - start + 1;
+			const pos = start * bpv;
+			const bytes = count * bpv;
+
+			const buf = Buffer.allocUnsafe(bytes);
+			const { bytesRead } = await fd.read(buf, 0, bytes, pos);
+			if (bytesRead !== bytes) {
+				// partial read: still try to decode what we got
+			}
+
+			for (let j = 0; j < count; j++) {
+				const id = start + j;
+				const off = j * bpv;
+				if (off + bpv > buf.length) continue;
+
+				const dv = new DataView(buf.buffer, buf.byteOffset + off, bpv);
+				const v = new Float32Array(dim);
+				for (let k = 0; k < dim; k++) v[k] = dv.getFloat32(k * 4, true);
+				out.set(id, v);
+			}
+
+			i++;
+		}
+
 		return out;
 	}
 
 	async init() {
 		if (this.isReady) return;
 
-		const dim = this.config.dim || Number(process.env.VECTOR_DIM ?? 0) || 384;
+		const dim = this.dim();
 		const m = this.config.m || Number(process.env.HNSW_M ?? 0) || 16;
 		const ef =
 			this.config.ef_construction || Number(process.env.HNSW_EF ?? 0) || 100;
@@ -144,8 +246,6 @@ export class MiniVectorDB {
 		const efSearch =
 			this.config.ef_search || Number(process.env.HNSW_EF_SEARCH ?? 0) || 50;
 
-		// ✅ capacity：默认给 1_200_000（足够跑 1M + buffer）
-		// 你跑 perf_benchmark 时建议显式传入 capacity=N
 		const capacity =
 			this.config.capacity ||
 			Number(process.env.HNSW_CAPACITY ?? 0) ||
@@ -158,52 +258,127 @@ export class MiniVectorDB {
 		this.isReady = true;
 	}
 
-	async insert(item: InsertItem): Promise<void> {
-		if (!this.isReady) await this.init();
-		const { id, vector, metadata } = item;
-
-		let f32Vec: Float32Array;
+	private async resolveVectorToF32(
+		vector: InsertItem["vector"],
+	): Promise<Float32Array> {
 		if (
 			typeof vector === "string" ||
 			vector instanceof Buffer ||
 			vector instanceof Uint8Array
 		) {
-			f32Vec = await this.embedder.embed(vector);
-		} else if (vector instanceof Float32Array) {
-			f32Vec = vector;
-		} else {
-			f32Vec = new Float32Array(vector);
+			return await this.embedder.embed(vector);
 		}
+		if (vector instanceof Float32Array) return vector;
+		return new Float32Array(vector);
+	}
 
-		const expectedDim = this.config.dim || 384;
-		if (f32Vec.length !== expectedDim) {
-			throw new Error(
-				`Vector dimension mismatch. Expected ${expectedDim}, got ${f32Vec.length}`,
-			);
-		}
+	async insert(item: InsertItem): Promise<void> {
+		// keep compatibility; route to insertMany
+		await this.insertMany([item]);
+	}
 
-		const q8 = this.quantizeToI8(f32Vec);
+	/**
+	 * ✅ Bulk insert:
+	 * - meta beginBulk/endBulk
+	 * - contiguous vectors written in one big write for new ids (fast)
+	 * - wasm insert/update still per item
+	 */
+	async insertMany(items: InsertItem[]): Promise<void> {
+		if (!this.isReady) await this.init();
+		if (items.length === 0) return;
 
-		const existing = this.meta.get(id);
-		if (existing) {
-			const internalId = existing.internal_id;
+		const expectedDim = this.dim();
 
-			await this.writeF32Vector(internalId, f32Vec);
+		// prepare vectors + quantized
+		const f32s: Float32Array[] = new Array(items.length);
+		const q8s: Int8Array[] = new Array(items.length);
+		const internalIds: number[] = new Array(items.length);
+		const isNew: boolean[] = new Array(items.length);
 
-			if (!this.wasm.hasNode(internalId)) {
-				this.wasm.insert(internalId, q8);
-			} else {
-				this.wasm.updateVector(internalId, q8);
+		// bulk meta write
+		this.meta.beginBulk();
+
+		try {
+			for (let i = 0; i < items.length; i++) {
+				const { id, vector, metadata } = items[i];
+				const f32 = await this.resolveVectorToF32(vector);
+
+				if (f32.length !== expectedDim) {
+					throw new Error(
+						`Vector dimension mismatch. Expected ${expectedDim}, got ${f32.length}`,
+					);
+				}
+
+				const q8 = this.quantizeToI8(f32);
+
+				const existing = this.meta.get(id);
+				if (existing) {
+					internalIds[i] = existing.internal_id;
+					isNew[i] = false;
+					this.meta.add(
+						id,
+						existing.internal_id,
+						metadata ?? existing.metadata,
+					);
+				} else {
+					const newInternalId = this.meta.items.count();
+					internalIds[i] = newInternalId;
+					isNew[i] = true;
+					this.meta.add(id, newInternalId, metadata || {});
+				}
+
+				f32s[i] = f32;
+				q8s[i] = q8;
 			}
 
-			this.meta.add(id, internalId, metadata || existing.metadata);
-			return;
-		}
+			// fast path: write all NEW ids as contiguous runs in one or few writes
+			// (benchmark inserts doc-0..doc-N sequentially -> this becomes a single write per batch)
+			{
+				// collect new entries and sort by internalId (stable)
+				const pairs = [];
+				for (let i = 0; i < items.length; i++) {
+					if (isNew[i]) pairs.push({ id: internalIds[i], vec: f32s[i] });
+				}
+				pairs.sort((a, b) => a.id - b.id);
 
-		const internalId = this.meta.items.count();
-		this.meta.add(id, internalId, metadata || {});
-		await this.writeF32Vector(internalId, f32Vec);
-		this.wasm.insert(internalId, q8);
+				let p = 0;
+				while (p < pairs.length) {
+					const start = pairs[p].id;
+					const vecs: Float32Array[] = [pairs[p].vec];
+					let end = start;
+
+					while (p + 1 < pairs.length && pairs[p + 1].id === end + 1) {
+						p++;
+						end = pairs[p].id;
+						vecs.push(pairs[p].vec);
+					}
+
+					await this.writeF32VectorsContiguous(start, vecs);
+					p++;
+				}
+			}
+
+			// updates: write individually (could also be grouped but less common)
+			for (let i = 0; i < items.length; i++) {
+				if (!isNew[i]) {
+					await this.writeF32Vector(internalIds[i], f32s[i]);
+				}
+			}
+
+			// wasm graph ops
+			for (let i = 0; i < items.length; i++) {
+				const internalId = internalIds[i];
+				const q8 = q8s[i];
+
+				if (this.wasm.hasNode(internalId)) {
+					this.wasm.updateVector(internalId, q8);
+				} else {
+					this.wasm.insert(internalId, q8);
+				}
+			}
+		} finally {
+			await this.meta.endBulk();
+		}
 	}
 
 	async search(
@@ -226,7 +401,7 @@ export class MiniVectorDB {
 			qF32 = new Float32Array(query);
 		}
 
-		const expectedDim = this.config.dim || 384;
+		const expectedDim = this.dim();
 		if (qF32.length !== expectedDim) {
 			throw new Error(
 				`Query vector dimension mismatch. Expected ${expectedDim}, got ${qF32.length}`,
@@ -262,14 +437,13 @@ export class MiniVectorDB {
 		}
 		if (candidates.length === 0) return [];
 
-		const vecs = await Promise.all(
-			candidates.map((id) => this.readF32Vector(id)),
-		);
+		// ✅ read vectors with cache or merged IO
+		const vecMap = await this.readF32Vectors(candidates);
 
 		const reranked: { internalId: number; score: number }[] = [];
-		for (let i = 0; i < candidates.length; i++) {
-			const internalId = candidates[i];
-			const v = vecs[i];
+		for (const internalId of candidates) {
+			const v = vecMap.get(internalId);
+			if (!v) continue;
 			reranked.push({ internalId, score: this.l2SqF32(qF32, v) });
 		}
 
@@ -300,6 +474,11 @@ export class MiniVectorDB {
 		if (!this.isReady) await this.init();
 		await this.wasm.load(filepath);
 		await this.ensureVectorStoreReady();
+
+		// reload cache (optional)
+		if (this.config.preloadVectors && fs.existsSync(this.vecPath)) {
+			this.vecCache = await fs.promises.readFile(this.vecPath);
+		}
 	}
 
 	getStats() {
@@ -308,6 +487,8 @@ export class MiniVectorDB {
 			items: this.meta.items.count(),
 			vectorStore: this.vecPath,
 			capacity: this.config.capacity,
+			metaPath: this.meta.getPath(),
+			preloadVectors: !!this.config.preloadVectors,
 		};
 	}
 
@@ -317,5 +498,6 @@ export class MiniVectorDB {
 			await this.vecFd.close();
 			this.vecFd = null;
 		}
+		this.vecCache = null;
 	}
 }

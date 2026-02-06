@@ -1,0 +1,8 @@
+{
+	"files.associations": {
+		"assembly/**/*.as": "assemblyscript"
+	},
+	"[assemblyscript]": {
+		"editor.defaultFormatter": "AssemblyScript.assemblyscript"
+	}
+}

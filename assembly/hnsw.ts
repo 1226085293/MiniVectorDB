@@ -1,4 +1,5 @@
-// assembly/hnsw.ts
+// @ts-nocheck
+
 import { dist_l2_sq } from "./math";
 import { alloc } from "./memory";
 import {
@@ -46,6 +47,32 @@ let used_mark_ptr: usize = 0; // u8[MAX_EF]
 // neighbor selection scratch
 let sel_ids_ptr: usize = 0; // i32[MAX_EF]
 let sel_count: i32 = 0;
+
+// --- RNG (xorshift32) ---
+let rng_state: u32 = 2463534242; // default non-zero
+
+export function seed_rng(seed: u32): void {
+	// ensure non-zero
+	rng_state = seed != 0 ? seed : 2463534242;
+}
+
+@inline
+function xorshift32(): u32 {
+	let x = rng_state;
+	x ^= x << 13;
+	x ^= x >>> 17;
+	x ^= x << 5;
+	rng_state = x;
+	return x;
+}
+
+// return float in [0,1)
+@inline
+function rand01(): f64 {
+	// use top 24 bits for stable float
+	let r = xorshift32() >>> 8; // 24-bit
+	return <f64>r / <f64>0x01000000; // 2^24
+}
 
 // --- HELPERS ---
 function get_node_ptr(id: i32): usize {
@@ -227,7 +254,6 @@ function res_pop(size: i32): i32 {
 	return size;
 }
 
-// replace root (worst) with better element and sift-down (faster than pop+push)
 function res_replace_root(size: i32, id: i32, dist: f32): void {
 	store<i32>(res_ids_ptr + 0, id);
 	store<f32>(res_dist_ptr + 0, dist);
@@ -254,7 +280,6 @@ function res_replace_root(size: i32, id: i32, dist: f32): void {
 	}
 }
 
-// full heap-sort (used only for SEARCH results)
 function res_to_sorted_full(size: i32): i32 {
 	let n = size;
 	for (let i = n - 1; i >= 0; i--) {
@@ -265,14 +290,11 @@ function res_to_sorted_full(size: i32): i32 {
 	return n;
 }
 
-// partial extraction: get k smallest from res arrays (O(k*ef)), k is tiny in build (<=64)
-// writes ascending order into out buffers.
 function res_extract_k_smallest_sorted(res_size: i32, k: i32): i32 {
 	if (k <= 0 || res_size <= 0) return 0;
 	if (k > res_size) k = res_size;
 	if (k > MAX_EF) k = MAX_EF;
 
-	// mark clear for [0..res_size)
 	for (let i: i32 = 0; i < res_size; i++) {
 		store<u8>(used_mark_ptr + <usize>i, 0);
 	}
@@ -320,7 +342,6 @@ export function init_index(capacity: i32): void {
 	out_dist_ptr = alloc(<usize>MAX_EF * 4);
 
 	used_mark_ptr = alloc(<usize>MAX_EF); // u8
-
 	sel_ids_ptr = alloc(<usize>MAX_EF * 4);
 
 	entry_point_id = -1;
@@ -339,17 +360,14 @@ export function init_index(capacity: i32): void {
 
 function get_random_level(): i32 {
 	let level: i32 = 0;
-	while (Math.random() < 0.5 && level < MAX_LAYERS - 1) {
+	// p=0.5 geometric distribution
+	while (rand01() < 0.5 && level < MAX_LAYERS - 1) {
 		level++;
 	}
 	return level;
 }
 
 // --- SEARCH LAYER (stable-quality core) ---
-// Always maintains full ef "best" set in res heap (quality is NOT reduced).
-// Export path:
-//  - For query search: full sort output
-//  - For build/insert: partial extract only (no full sort), but still based on full ef best set.
 function search_layer(
 	query_vec_ptr: usize,
 	entry_node: i32,
@@ -363,7 +381,6 @@ function search_layer(
 
 	visited_next_stamp();
 
-	// frontier capacity slightly larger than ef improves convergence and stability
 	let cand_cap: i32 = ef * 2 + 32;
 	if (cand_cap > MAX_EF) cand_cap = MAX_EF;
 	if (cand_cap < ef) cand_cap = ef;
@@ -425,8 +442,6 @@ function search_layer(
 		return res_to_sorted_full(res_size);
 	}
 
-	// build: we only need a candidate pool for neighbor heuristic selection.
-	// IMPORTANT: pool extraction is from the FULL ef-best set in res heap (quality preserved).
 	let pool: i32 = target * 2;
 	if (pool < target) pool = target;
 	if (pool > ef) pool = ef;
@@ -436,11 +451,7 @@ function search_layer(
 }
 
 // --- Heuristic neighbor selection (diversity-aware) ---
-function select_neighbors_heuristic(
-	query_vec_ptr: usize,
-	found: i32,
-	target: i32,
-): i32 {
+function select_neighbors_heuristic(query_vec_ptr: usize, found: i32, target: i32): i32 {
 	sel_count = 0;
 	if (found <= 0) return 0;
 	if (target <= 0) return 0;
@@ -469,7 +480,6 @@ function select_neighbors_heuristic(
 		}
 	}
 
-	// fill remaining from best list
 	if (sel_count < target) {
 		for (let i: i32 = 0; i < found && sel_count < target; i++) {
 			let cand_id = load<i32>(out_ids_ptr + <usize>i * 4);
@@ -565,7 +575,6 @@ export function insert(id: i32, vector_data_offset: usize): void {
 	let curr_obj = entry_point_id;
 	let curr_dist = dist_l2_sq(target_vec_ptr, get_vector_ptr(curr_obj));
 
-	// Greedy descent
 	for (let l = max_level; l > level; l--) {
 		let changed = true;
 		while (changed) {
@@ -592,7 +601,6 @@ export function insert(id: i32, vector_data_offset: usize): void {
 		}
 	}
 
-	// Connect down
 	for (let l = level < max_level ? level : max_level; l >= 0; l--) {
 		let target = l == 0 ? M_MAX0 : M;
 
@@ -644,7 +652,6 @@ export function search(query_vec_offset: usize, k: i32): i32 {
 	let curr_obj = entry_point_id;
 	let curr_dist = dist_l2_sq(query_vec_offset, get_vector_ptr(curr_obj));
 
-	// Greedy descent on upper layers
 	for (let l = max_level; l > 0; l--) {
 		let changed = true;
 		while (changed) {
@@ -690,7 +697,7 @@ export function search(query_vec_offset: usize, k: i32): i32 {
 }
 
 /* ------------------------------
-   ✅ Dump V1 (unchanged here)
+   ✅ Dump V1 (unchanged)
 --------------------------------*/
 
 const MAGIC_HNSW: i32 = 0x57534e48; // "HNSW"

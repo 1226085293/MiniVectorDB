@@ -56,7 +56,12 @@ export class WasmBridge {
 			}
 		}
 
-		// ✅ 关键修复：init_index(capacity) 必须 >= 最大 internalId + 1，否则会 OOB
+		// seed RNG in wasm (avoid Math.random in hot path)
+		if (typeof this.wasmModule.seed_rng === "function") {
+			const seed = (Date.now() ^ (process.pid << 16)) >>> 0;
+			this.wasmModule.seed_rng(seed);
+		}
+
 		const cap = config?.capacity ?? 10000;
 		this.wasmModule.init_index(cap);
 
@@ -148,7 +153,12 @@ export class WasmBridge {
 			}
 		}
 
-		// ✅ load_index 内部会 init_index(dump_max_elements)，所以这里不用担心 capacity
+		// reseed after reset
+		if (typeof this.wasmModule.seed_rng === "function") {
+			const seed = (Date.now() ^ (process.pid << 16)) >>> 0;
+			this.wasmModule.seed_rng(seed);
+		}
+
 		const ptr = this.wasmModule.alloc(buf.length);
 		new Uint8Array(this.memory.buffer, ptr, buf.length).set(buf);
 		this.wasmModule.load_index(ptr, buf.length);

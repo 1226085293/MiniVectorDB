@@ -1,6 +1,3 @@
-// assembly/index.ts
-// Entry point for the WASM module
-
 import {
 	init_memory,
 	alloc,
@@ -19,6 +16,7 @@ import {
 	load_index,
 	get_index_dump_size,
 	has_node,
+	seed_rng,
 } from "./hnsw";
 
 import { dist_l2_sq, dist_dot } from "./math";
@@ -32,7 +30,6 @@ export function set_search_config(ef_search: i32): void {
 	update_search_config(ef_search);
 }
 
-// Re-export functions to be used by the host
 export { init_memory, alloc, get_memory_usage, set_memory_usage, reset_memory };
 
 export {
@@ -45,11 +42,11 @@ export {
 	save_index,
 	load_index,
 	get_index_dump_size,
+	seed_rng,
 };
 
 export { dist_l2_sq, dist_dot };
 
-// Optional: Test function
 export function test_simd(ptr1: usize, ptr2: usize): f32 {
 	return dist_l2_sq(ptr1, ptr2);
 }

@@ -1,4 +1,3 @@
-// assembly/config.ts
 /**
  * @zh-CN 配置常量
  * @en Configuration constants
