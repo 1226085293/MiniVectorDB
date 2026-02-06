@@ -15,12 +15,13 @@
 		"build:ts": "tsc",
 		"build": "npm run asbuild && npm run build:ts",
 		"start": "ts-node src/api/server.ts",
-		"test": "ts-node tests/persistence_test.ts"
+		"test": "ts-node tests/test.ts"
 	},
 	"dependencies": {
-		"@xenova/transformers": "^2.16.0",
 		"@assemblyscript/loader": "^0.27.0",
 		"@fastify/cors": "^10.0.0",
+		"@xenova/transformers": "^2.16.0",
+		"dotenv": "^17.2.4",
 		"fastify": "^5.0.0",
 		"lokijs": "^1.5.12"
 	},

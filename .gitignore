@@ -1,7 +1,8 @@
 node_modules/
 dist/
 build/
-data/*.bin
-data/*.json
+data/
 .DS_Store
-```
+.env
+.env.local
+.env.*.local

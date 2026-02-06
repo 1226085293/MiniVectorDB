@@ -1,37 +1,43 @@
-import { WasmBridge } from '../src/core/wasm-bridge';
-import { MetaDB } from '../src/storage/meta-db';
+import { MiniVectorDB } from "../src/index";
 
 async function main() {
-    console.log("Starting basic test...");
-    
-    // 1. Test MetaDB (Pure JS)
-    console.log("Initializing MetaDB...");
-    const meta = new MetaDB();
-    await meta.ready();
-    meta.add("doc-1", 0, { title: "Hello World", tag: "test" });
-    meta.add("doc-2", 1, { title: "Vector DB", tag: "prod" });
-    
-    const item = meta.get("doc-1");
-    console.log("MetaDB fetch:", item?.metadata);
+	console.log("--- BASIC TEST START ---");
 
-    // 2. Test WASM
-    const db = new WasmBridge();
-    await db.init();
+	// Using default config (dim: 384)
+	const db = new MiniVectorDB();
+	await db.init();
 
-    // Create a dummy vector (DIM=128)
-    const vec1 = new Float32Array(128).fill(0.1);
-    const vec2 = new Float32Array(128).fill(0.2);
+	console.log("Inserting documents...");
+	await db.insert({
+		id: "doc-1",
+		vector: new Array(384).fill(0.1),
+		metadata: { title: "Hello Vector" },
+	});
 
-    console.log("Inserting vector 0...");
-    db.insert(0, vec1);
-    
-    console.log("Inserting vector 1...");
-    db.insert(1, vec2);
+	await db.insert({
+		id: "doc-2",
+		vector: new Array(384).fill(0.2),
+		metadata: { title: "World Vector" },
+	});
 
-    console.log("Searching...");
-    // This won't return real results yet as search is mocked
-    const res = db.search(vec1, 1);
-    console.log("Search Result Ptr:", res);
+	console.log("Searching for doc-1 pattern...");
+	const query = new Array(384).fill(0.1);
+	const results = await db.search(query, 1);
+
+	console.log("Results:", JSON.stringify(results, null, 2));
+
+	if (results.length > 0 && results[0].id === "doc-1") {
+		console.log("✅ BASIC TEST PASSED");
+	} else {
+		console.error("❌ BASIC TEST FAILED");
+		process.exit(1);
+	}
+
+	await db.close();
+	process.exit(0);
 }
 
-main().catch(console.error);
+main().catch((e) => {
+	console.error(e);
+	process.exit(1);
+});

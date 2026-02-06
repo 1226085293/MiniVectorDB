@@ -1,114 +1,142 @@
-import { spawn, ChildProcess } from 'child_process';
-import path from 'path';
+// tests/api_test.ts
+import { spawn } from "child_process";
+import path from "path";
+import dotenv from "dotenv";
+import net from "net";
 
-// Use global fetch (Node 18+) or install node-fetch if older
-// @ts-ignore
-const fetch = global.fetch;
+// 加载本地 .env 配置
+dotenv.config({ path: path.join(__dirname, "../.env") });
 
-async function sleep(ms: number) { return new Promise(r => setTimeout(r, ms)); }
-
-async function main() {
-    console.log("--- API TEST START ---");
-    const serverPath = path.join(__dirname, '../src/api/server.ts');
-    
-    // Start Server as a child process
-    console.log("Starting server...");
-    // Use npx ts-node to run the server
-    // On Windows, use 'npx.cmd'
-    const isWin = process.platform === "win32";
-    const cmd = isWin ? "npx.cmd" : "npx";
-    
-    const TEST_PORT = 3001;
-    const serverProcess = spawn(cmd, ["ts-node", serverPath], {
-        stdio: 'pipe',
-        shell: true,
-        env: { ...process.env, PORT: TEST_PORT.toString() }
-    });
-
-    let serverUrl = `http://localhost:${TEST_PORT}`;
-    let ready = false;
-
-    serverProcess.stdout.on('data', (data) => {
-        const msg = data.toString();
-        console.log("[SERVER]:", msg.trim());
-        if (msg.includes("Server listening")) {
-            ready = true;
-        }
-        // Also check for EADDRINUSE in stdout/stderr if printed there
-        if (msg.includes("EADDRINUSE")) {
-             console.error("Port " + TEST_PORT + " is already in use!");
-             ready = false;
-             process.exit(1);
-        }
-    });
-    
-    serverProcess.stderr.on('data', (data) => console.error("[SERVER ERR]:", data.toString()));
-
-    // Wait for server to be ready
-    let retries = 20;
-    while (!ready && retries > 0) {
-        await sleep(500);
-        retries--;
-    }
-    
-    if (!ready) {
-        console.error("Server failed to start in time.");
-        serverProcess.kill();
-        process.exit(1);
-    }
-
-    try {
-        // 1. Insert
-        console.log("\n1. Testing /insert ...");
-        const vec = new Array(128).fill(0.1);
-        const insertRes = await fetch(`${serverUrl}/insert`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                id: "api-test-1",
-                vector: vec,
-                metadata: { type: "test-api", lang: "js" }
-            })
-        });
-        const insertJson = await insertRes.json();
-        console.log("Insert Response:", insertJson);
-        if (insertJson.status !== "ok") throw new Error("Insert failed");
-
-        // 2. Search
-        console.log("\n2. Testing /search ...");
-        const searchRes = await fetch(`${serverUrl}/search`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                vector: vec,
-                k: 5,
-                filter: { lang: "js" }
-            })
-        });
-        const searchJson = await searchRes.json();
-        console.log("Search Response:", JSON.stringify(searchJson, null, 2));
-        
-        if (!searchJson.results || searchJson.results.length === 0) {
-            throw new Error("Search returned no results");
-        }
-        if (searchJson.results[0].id !== "api-test-1") {
-            throw new Error("Search returned wrong ID");
-        }
-
-        console.log("\nAPI TEST PASSED!");
-    } catch (e) {
-        console.error("API TEST FAILED:", e);
-    } finally {
-        console.log("Stopping server...");
-        // Kill process tree on Windows is tricky, but basic kill might work for testing
-        // Using taskkill on windows to be sure if simple kill fails
-        if (isWin) {
-             spawn("taskkill", ["/pid", serverProcess.pid!.toString(), "/f", "/t"]);
-        } else {
-             serverProcess.kill();
-        }
-        process.exit(0);
-    }
+// 获取随机可用端口
+function getAvailablePort(): Promise<number> {
+	return new Promise((resolve, reject) => {
+		const server = net.createServer();
+		server.listen(0, "127.0.0.1", () => {
+			const port = (server.address() as net.AddressInfo).port;
+			server.close(() => resolve(port));
+		});
+		server.on("error", reject);
+	});
 }
 
-main();
+async function main() {
+	console.log("--- API TEST START ---");
+
+	const TEST_PORT = await getAvailablePort();
+	console.log(`Using port: ${TEST_PORT}`);
+	console.log(`Using VECTOR_DIM: ${process.env.VECTOR_DIM || "384 (default)"}`);
+
+	const serverPath = path.join(__dirname, "../src/api/server.ts");
+	const cmd = process.platform === "win32" ? "npx.cmd" : "npx";
+
+	const serverProcess = spawn(cmd, ["ts-node", serverPath], {
+		stdio: ["ignore", "pipe", "pipe"],
+		shell: true,
+		env: {
+			...process.env,
+			PORT: TEST_PORT.toString(),
+		},
+	});
+
+	let serverUrl = `http://localhost:${TEST_PORT}`;
+	let outputBuffer = "";
+
+	serverProcess.stdout.on("data", (data) => {
+		const msg = data.toString();
+		outputBuffer += msg;
+		console.log("[SERVER OUT]", msg.trim());
+	});
+
+	serverProcess.stderr.on("data", (data) => {
+		const msg = data.toString();
+		outputBuffer += msg;
+		console.error("[SERVER ERR]", msg.trim());
+	});
+
+	const ready = await new Promise<boolean>((resolve) => {
+		let isReady = false;
+
+		const checkOutput = (data: string) => {
+			if (data.includes("Server listening") && !isReady) {
+				isReady = true;
+				resolve(true);
+			}
+		};
+
+		serverProcess.stdout.on("data", (data) => checkOutput(data.toString()));
+		serverProcess.stderr.on("data", (data) => checkOutput(data.toString()));
+
+		serverProcess.on("exit", (code) => {
+			if (!isReady) {
+				console.error(`Server process exited with code ${code}`);
+				resolve(false);
+			}
+		});
+
+		setTimeout(() => {
+			if (!isReady) {
+				console.error("Server start timeout (15s)");
+				resolve(false);
+			}
+		}, 15000);
+	});
+
+	if (!ready) {
+		console.error("\n--- Server Output ---");
+		console.error(outputBuffer);
+		console.error("---------------------\n");
+		serverProcess.kill();
+		process.exit(1);
+	}
+
+	const vectorDim = parseInt(process.env.VECTOR_DIM || "384", 10);
+
+	try {
+		console.log(`Testing /insert with ${vectorDim} dim vector...`);
+		const insertResp = await fetch(`${serverUrl}/insert`, {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({
+				id: "api-test-1",
+				vector: new Array(vectorDim).fill(0.1),
+				metadata: { type: "api-test" },
+			}),
+		});
+
+		if (insertResp.status !== 200) {
+			const errData = await insertResp.json();
+			console.error("Insert failed:", errData);
+			throw new Error("API Insert Failed");
+		}
+
+		console.log("Testing /search ...");
+		const searchResp = await fetch(`${serverUrl}/search`, {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ vector: new Array(vectorDim).fill(0.1), k: 1 }),
+		});
+		const searchData: any = await searchResp.json();
+
+		if (searchData.results && searchData.results[0]?.id === "api-test-1") {
+			console.log("✅ API TEST PASSED!");
+		} else {
+			console.error("Search results:", searchData);
+			throw new Error("API Search mismatch");
+		}
+	} catch (e) {
+		console.error("❌ API TEST FAILED:", e);
+		process.exit(1);
+	} finally {
+		serverProcess.kill();
+		if (process.platform === "win32" && serverProcess.pid) {
+			try {
+				spawn("taskkill", ["/pid", serverProcess.pid.toString(), "/f", "/t"]);
+			} catch {}
+		}
+	}
+}
+
+main().catch((e) => {
+	console.error(e);
+	process.exit(1);
+});

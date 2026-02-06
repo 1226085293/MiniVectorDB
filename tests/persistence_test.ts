@@ -1,43 +1,57 @@
-import { WasmBridge } from "../src/core/wasm-bridge";
+import { MiniVectorDB } from "../src/index";
 import path from "path";
 import fs from "fs";
 
-const SAVE_PATH = path.join(__dirname, "../data/dump.bin");
+const DUMP_PATH = path.join(process.cwd(), "data/persistence_dump");
+const META_PATH = path.join(process.cwd(), "data/persistence_meta.json");
 
 async function main() {
-	// Cleanup previous test
-	if (fs.existsSync(SAVE_PATH)) fs.unlinkSync(SAVE_PATH);
+	console.log("--- PERSISTENCE TEST START ---");
 
-	console.log("--- PHASE 1: Insert & Save ---");
-	const db1 = new WasmBridge();
+	// Clean up
+	if (fs.existsSync(DUMP_PATH)) fs.unlinkSync(DUMP_PATH);
+	if (fs.existsSync(META_PATH)) fs.unlinkSync(META_PATH);
+
+	// 1. Save data
+	console.log("Stage 1: Inserting and Saving...");
+	const db1 = new MiniVectorDB({ metaDbPath: META_PATH });
 	await db1.init();
 
-	const vec = new Float32Array(128).fill(0.5);
-	db1.insert(0, vec);
-	console.log("Inserted ID: 0");
+	// Use a unique vector to ensure search accuracy
+	const vec = new Array(384).fill(0).map((_, i) => i / 384);
+	await db1.insert({
+		id: "persist-1",
+		vector: vec,
+		metadata: { info: "saved" },
+	});
 
-	await db1.save(SAVE_PATH);
+	await db1.save(DUMP_PATH);
+	await db1.close();
+	console.log("Data saved and DB closed.");
 
-	console.log("\n--- PHASE 2: Load & Verify ---");
-	const db2 = new WasmBridge();
+	// 2. Load data
+	console.log("\nStage 2: Loading and Verifying...");
+	const db2 = new MiniVectorDB({ metaDbPath: META_PATH });
 	await db2.init();
+	await db2.load(DUMP_PATH);
 
-	// Verify empty before load (Search should return nothing or garbage, or just not crash)
-	// Actually our simple mock search might behave weirdly if empty, but let's load first.
+	// Important: check if meta load worked
+	console.log(`MetaDB has ${db2.getStats().items} items.`);
 
-	await db2.load(SAVE_PATH);
+	const results = await db2.search(vec, 1);
+	console.log("Loaded Search Results:", JSON.stringify(results, null, 2));
 
-	// Construct a query vector (same as inserted)
-	const query = new Float32Array(128).fill(0.5);
-	const result = db2.search(query, 1);
-
-	console.log("Search Result ID:", result);
-
-	if (result.length === 0) {
-		console.log("SUCCESS: Persistence works!");
+	if (results.length > 0 && results[0].id === "persist-1") {
+		console.log("✅ PERSISTENCE TEST PASSED");
 	} else {
-		console.error("FAILURE: Could not find ID 0 after reload.");
+		console.error("❌ PERSISTENCE TEST FAILED: Result mismatch or empty");
+		process.exit(1);
 	}
+
+	await db2.close();
 }
 
-main().catch(console.error);
+main().catch((e) => {
+	console.error(e);
+	process.exit(1);
+});
