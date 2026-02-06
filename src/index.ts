@@ -43,35 +43,41 @@ export interface DBConfig {
 	maxAnnK?: number;
 }
 
+/**
+ * MiniVectorDB
+ * 一个“本地向量数据库”的最小实现：把文本/向量 -> 向量化 -> 存储 -> 近似检索(ANN) -> 精排返回结果。
+ * A minimal local vector database: embed -> store -> ANN retrieve -> rerank -> return results.
+ */
 export class MiniVectorDB {
-	config: DBConfig;
+	// =========================
+	// Public members (公开成员)
+	// =========================
+
+	/**
+	 * 配置项（公开可读/可改）：维度、容量、模型名、索引参数等。
+	 * Public config: dimension, capacity, model name, index parameters, etc.
+	 */
+	public config: DBConfig;
+
 	private wasm: WasmBridge;
 	private meta: MetaDB;
 	private embedder: LocalEmbedder;
-	private isReady: boolean = false;
+
+	private isReady = false;
 
 	private vecPath: string;
 	private vecFd: fs.promises.FileHandle | null = null;
 	private vecCache: Buffer | null = null;
 
-	private wasmMaxEf: number = 0;
+	private wasmMaxEf = 0;
 
-	private opLock: Promise<void> = Promise.resolve();
-	private async withLock<T>(fn: () => Promise<T> | T): Promise<T> {
-		let release!: () => void;
-		const next = new Promise<void>((r) => (release = r));
-		const prev = this.opLock;
-		this.opLock = prev.then(() => next);
-		await prev;
-		try {
-			return await fn();
-		} finally {
-			release();
-		}
-	}
-
+	/**
+	 * 构造函数：创建数据库实例（不会立刻加载/初始化底层索引，首次操作会自动 init）。
+	 * Constructor: creates an instance (does NOT fully init immediately; first operation will auto-init).
+	 */
 	constructor(config: DBConfig = {}) {
 		this.config = config;
+
 		this.wasm = new WasmBridge();
 		this.meta = new MetaDB(config.metaDbPath);
 		this.embedder = new LocalEmbedder(
@@ -83,202 +89,14 @@ export class MiniVectorDB {
 			config.vectorStorePath || path.join(__dirname, "../data/vectors.f32.bin");
 	}
 
-	private dim(): number {
-		return this.config.dim || Number(process.env.VECTOR_DIM ?? 0) || 384;
-	}
-
-	private bytesPerVec(): number {
-		return this.dim() * 4;
-	}
-
-	private capacity(): number {
-		return (
-			this.config.capacity ||
-			Number(process.env.HNSW_CAPACITY ?? 0) ||
-			1_200_000
-		);
-	}
-
-	private maxAnnK(): number {
-		const fromCfg = this.config.maxAnnK;
-		const fromEnv = process.env.MAX_ANN_K ? Number(process.env.MAX_ANN_K) : 0;
-		let cap = (fromCfg ?? fromEnv) || 10_000;
-
-		if (this.wasmMaxEf > 0) cap = Math.min(cap, this.wasmMaxEf);
-
-		if (cap <= 0) cap = 1;
-		return cap;
-	}
-
-	// ✅ normalize vectors so: stored F32 == quantized I8 semantics
-	private normalizeF32InPlace(v: Float32Array): Float32Array {
-		let normSq = 0;
-		for (let i = 0; i < v.length; i++) normSq += v[i] * v[i];
-		if (normSq <= 0) return v;
-		const inv = 1 / Math.sqrt(normSq);
-		for (let i = 0; i < v.length; i++) v[i] *= inv;
-		return v;
-	}
-
-	private async ensureVectorStoreReady(): Promise<void> {
-		if (this.vecFd) return;
-
-		const dir = path.dirname(this.vecPath);
-		if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-
-		const exists = fs.existsSync(this.vecPath);
-		this.vecFd = await fs.promises.open(this.vecPath, exists ? "r+" : "w+");
-
-		if (this.config.preloadVectors && exists) {
-			this.vecCache = await fs.promises.readFile(this.vecPath);
-		}
-	}
-
-	private quantizeToI8(v: Float32Array): Int8Array {
-		const out = new Int8Array(v.length);
-		for (let i = 0; i < v.length; i++) {
-			let x = v[i];
-			if (x > 1) x = 1;
-			else if (x < -1) x = -1;
-			let q = Math.round(x * 127);
-			if (q > 127) q = 127;
-			else if (q < -127) q = -127;
-			out[i] = q;
-		}
-		return out;
-	}
-
-	private l2SqF32(a: Float32Array, b: Float32Array): number {
-		let s = 0;
-		for (let i = 0; i < a.length; i++) {
-			const d = a[i] - b[i];
-			s += d * d;
-		}
-		return s;
-	}
-
-	private ensureCacheCapacity(minBytes: number) {
-		if (!this.config.preloadVectors) return;
-		if (!this.vecCache) {
-			this.vecCache = Buffer.allocUnsafe(minBytes);
-			this.vecCache.fill(0);
-			return;
-		}
-		if (this.vecCache.length < minBytes) {
-			const old = this.vecCache;
-			const next = Buffer.allocUnsafe(minBytes);
-			old.copy(next, 0, 0, old.length);
-			next.fill(0, old.length);
-			this.vecCache = next;
-		}
-	}
-
-	private async writeF32VectorsContiguous(
-		startInternalId: number,
-		vectors: Float32Array[],
-	): Promise<void> {
-		await this.ensureVectorStoreReady();
-		const fd = this.vecFd!;
-		const bpv = this.bytesPerVec();
-		const totalBytes = vectors.length * bpv;
-		const pos = startInternalId * bpv;
-
-		const buf = Buffer.allocUnsafe(totalBytes);
-		for (let i = 0; i < vectors.length; i++) {
-			const v = vectors[i];
-			const slice = Buffer.from(v.buffer, v.byteOffset, v.byteLength);
-			slice.copy(buf, i * bpv, 0, bpv);
-		}
-
-		const { bytesWritten } = await fd.write(buf, 0, totalBytes, pos);
-		if (bytesWritten !== totalBytes) {
-			throw new Error(
-				`Vector store bulk write failed. bytesWritten=${bytesWritten}, total=${totalBytes}`,
-			);
-		}
-
-		if (this.config.preloadVectors) {
-			this.ensureCacheCapacity(pos + totalBytes);
-			this.vecCache!.set(buf, pos);
-		}
-	}
-
-	private async writeF32Vector(
-		internalId: number,
-		v: Float32Array,
-	): Promise<void> {
-		await this.writeF32VectorsContiguous(internalId, [v]);
-	}
-
-	private async readF32Vectors(
-		internalIds: number[],
-	): Promise<Map<number, Float32Array>> {
-		await this.ensureVectorStoreReady();
-		const fd = this.vecFd!;
-		const dim = this.dim();
-		const bpv = this.bytesPerVec();
-
-		const out = new Map<number, Float32Array>();
-		if (internalIds.length === 0) return out;
-
-		if (this.config.preloadVectors && this.vecCache) {
-			for (const id of internalIds) {
-				const pos = id * bpv;
-				if (pos + bpv > this.vecCache.length) continue;
-				const dv = new DataView(
-					this.vecCache.buffer,
-					this.vecCache.byteOffset + pos,
-					bpv,
-				);
-				const v = new Float32Array(dim);
-				for (let i = 0; i < dim; i++) v[i] = dv.getFloat32(i * 4, true);
-				out.set(id, v);
-			}
-			return out;
-		}
-
-		const ids = Array.from(new Set(internalIds)).sort((a, b) => a - b);
-
-		let i = 0;
-		while (i < ids.length) {
-			const start = ids[i];
-			let end = start;
-
-			while (i + 1 < ids.length && ids[i + 1] === end + 1) {
-				i++;
-				end = ids[i];
-			}
-
-			const count = end - start + 1;
-			const pos = start * bpv;
-			const bytes = count * bpv;
-
-			const buf = Buffer.allocUnsafe(bytes);
-			const { bytesRead } = await fd.read(buf, 0, bytes, pos);
-
-			if (bytesRead !== bytes) {
-				throw new Error(
-					`Vector store short read. pos=${pos} need=${bytes} got=${bytesRead}`,
-				);
-			}
-
-			for (let j = 0; j < count; j++) {
-				const id = start + j;
-				const off = j * bpv;
-
-				const dv = new DataView(buf.buffer, buf.byteOffset + off, bpv);
-				const v = new Float32Array(dim);
-				for (let k = 0; k < dim; k++) v[k] = dv.getFloat32(k * 4, true);
-				out.set(id, v);
-			}
-
-			i++;
-		}
-
-		return out;
-	}
-
-	async init() {
+	/**
+	 * 初始化数据库（索引+元数据+向量文件）。
+	 * Init DB (index + metadata + vector store file).
+	 *
+	 * 你可以显式调用；但 insert/search 等方法也会自动调用它。
+	 * You can call explicitly; insert/search will auto-call it as needed.
+	 */
+	public async init(): Promise<void> {
 		return this.withLock(async () => {
 			if (this.isReady) return;
 
@@ -313,6 +131,8 @@ export class MiniVectorDB {
 
 			this.wasmMaxEf = await this.wasm.getMaxEf();
 
+			// 让 resultsCap 不超过 wasm 限制（如果存在）
+			// Clamp resultsCap by wasm limit (if any).
 			if (this.wasmMaxEf > 0) {
 				const clamp = Math.min(resultsCap, this.wasmMaxEf);
 				await this.wasm.setResultsCap(clamp);
@@ -332,51 +152,30 @@ export class MiniVectorDB {
 		});
 	}
 
-	private async resolveVectorToF32(
-		vector: InsertItem["vector"],
-	): Promise<Float32Array> {
-		if (
-			typeof vector === "string" ||
-			vector instanceof Buffer ||
-			vector instanceof Uint8Array
-		) {
-			const v = await this.embedder.embed(vector);
-			return this.normalizeF32InPlace(v);
-		}
-		if (vector instanceof Float32Array) {
-			const v = new Float32Array(vector); // avoid mutating caller buffer
-			return this.normalizeF32InPlace(v);
-		}
-		const v = new Float32Array(vector);
-		return this.normalizeF32InPlace(v);
-	}
-
-	private ensureWithinCapacity(internalId: number) {
-		const cap = this.capacity();
-		if (internalId < 0 || internalId >= cap) {
-			throw new Error(
-				`Internal ID out of capacity. id=${internalId}, capacity=${cap}. ` +
-					`Increase HNSW_CAPACITY / config.capacity.`,
-			);
-		}
-	}
-
-	private ensureAllocWithinCapacity(start: number, n: number) {
-		const cap = this.capacity();
-		const endExclusive = start + n;
-		if (start < 0 || n <= 0 || endExclusive > cap) {
-			throw new Error(
-				`Capacity overflow. need [${start}, ${endExclusive}) but capacity=${cap}. ` +
-					`Increase HNSW_CAPACITY / config.capacity.`,
-			);
-		}
-	}
-
-	async insert(item: InsertItem): Promise<void> {
+	/**
+	 * 插入单条数据（可传文本/二进制/向量）。
+	 * Insert one item (accepts text/binary/vector).
+	 *
+	 * - 如果传入 string/Buffer/Uint8Array，会先用本地模型转成向量（embedding）。
+	 * - If you pass string/Buffer/Uint8Array, it will be embedded locally into a vector first.
+	 */
+	public async insert(item: InsertItem): Promise<void> {
 		await this.insertMany([item]);
 	}
 
-	async insertMany(items: InsertItem[]): Promise<void> {
+	/**
+	 * 批量插入（推荐）：更快、更少 IO、写入更连续。
+	 * Batch insert (recommended): faster, fewer IO ops, more contiguous writes.
+	 *
+	 * 说明（给不懂向量数据库的用户）：
+	 * - “向量”就是把一段文本/图片等转成一个数字数组，表示其语义。
+	 * - 检索时会把查询也变成向量，然后找“最接近”的那些向量。
+	 *
+	 * Explanation:
+	 * - A "vector" is a numeric array representing the meaning/semantics of your text (or other data).
+	 * - Search converts the query to a vector and finds the nearest vectors.
+	 */
+	public async insertMany(items: InsertItem[]): Promise<void> {
 		return this.withLock(async () => {
 			if (!this.isReady) await this.init();
 			if (items.length === 0) return;
@@ -389,6 +188,8 @@ export class MiniVectorDB {
 			let newItemsCount = 0;
 			for (const it of items) if (!existingMap.get(it.id)) newItemsCount++;
 
+			// meta 支持 bulk 模式：失败可回滚，避免部分写入
+			// Meta bulk mode: allows rollback on failure, avoids partial commits.
 			this.meta.beginBulk();
 			let commit = false;
 
@@ -456,11 +257,13 @@ export class MiniVectorDB {
 					q8s[i] = q8;
 				}
 
-				// write new contiguous runs
+				// 新数据：尽量按 internalId 连续写入，减少磁盘随机写
+				// New items: write contiguous ranges by internalId to reduce random IO.
 				{
 					const pairs: { id: number; vec: Float32Array }[] = [];
-					for (let i = 0; i < items.length; i++)
+					for (let i = 0; i < items.length; i++) {
 						if (isNew[i]) pairs.push({ id: internalIds[i], vec: f32s[i] });
+					}
 					pairs.sort((a, b) => a.id - b.id);
 
 					let p = 0;
@@ -480,7 +283,8 @@ export class MiniVectorDB {
 					}
 				}
 
-				// existing: write individually
+				// 已存在数据：逐条覆盖写入
+				// Existing items: overwrite individually.
 				for (let i = 0; i < items.length; i++) {
 					if (!isNew[i]) {
 						await this.writeF32Vector(internalIds[i], f32s[i]);
@@ -491,7 +295,8 @@ export class MiniVectorDB {
 					await this.vecFd.sync();
 				}
 
-				// wasm ops
+				// 写入/更新 ANN 索引（WASM/HNSW）
+				// Insert/update ANN index (WASM/HNSW).
 				for (let i = 0; i < items.length; i++) {
 					const internalId = internalIds[i];
 					const q8 = q8s[i];
@@ -507,7 +312,8 @@ export class MiniVectorDB {
 					}
 				}
 
-				// commit meta last
+				// 最后提交 meta，保证“索引/向量文件”写成功才可见
+				// Commit meta last so items become visible only after index/vector writes succeed.
 				this.meta.addMany(metaEntries, existingMap);
 
 				commit = true;
@@ -517,23 +323,22 @@ export class MiniVectorDB {
 		});
 	}
 
-	private async ensureResultsCapAtLeast(n: number) {
-		if (n <= 0) return;
-
-		if (this.wasmMaxEf > 0) {
-			n = Math.min(n, this.wasmMaxEf);
-		}
-
-		const cur = await this.wasm.getResultsCap();
-		if (cur >= n) return;
-
-		let next = cur > 0 ? cur : 1000;
-		while (next < n) next = next * 2;
-
-		await this.wasm.setResultsCap(next);
-	}
-
-	async search(
+	/**
+	 * 搜索（向量相似度检索）。
+	 * Search (vector similarity retrieval).
+	 *
+	 * - query 可传：文本（string/Buffer）或向量（number[]/Float32Array）。
+	 * - k 是返回条数（Top-K）。
+	 * - filter 是可选的元数据过滤（例如只搜索某个标签/集合）。
+	 *
+	 * - query can be text or a vector.
+	 * - k is the number of results (Top-K).
+	 * - filter optionally restricts candidates by metadata.
+	 *
+	 * 注意：这里先用 ANN（近似）拿候选，再读取原始 float32 向量做精确重排（rerank）。
+	 * Note: ANN first retrieves candidates, then we rerank using exact float32 vectors.
+	 */
+	public async search(
 		query: number[] | Float32Array | string | Buffer | Uint8Array,
 		k: number = 10,
 		filter?: any,
@@ -578,6 +383,8 @@ export class MiniVectorDB {
 			const raw = await this.wasm.search(qI8, annK);
 			if (raw.length === 0) return [];
 
+			// 过滤 + 映射到实际存在的 meta
+			// Filter + ensure meta exists.
 			const candidates: number[] = [];
 			for (const r of raw) {
 				if (allowedSet && !allowedSet.has(r.id)) continue;
@@ -590,6 +397,8 @@ export class MiniVectorDB {
 			}
 			if (candidates.length === 0) return [];
 
+			// 读取原始 float32 向量做精确距离计算
+			// Load raw float32 vectors and compute exact distance.
 			const vecMap = await this.readF32Vectors(candidates);
 
 			const reranked: { internalId: number; score: number }[] = [];
@@ -618,17 +427,23 @@ export class MiniVectorDB {
 		});
 	}
 
-	async save(filepath: string) {
+	/**
+	 * 保存索引快照到文件（WASM 索引），并确保元数据与向量文件已落盘。
+	 * Save index snapshot (WASM index) and flush metadata/vector store to disk.
+	 */
+	public async save(filepath: string): Promise<void> {
 		return this.withLock(async () => {
-			// ✅ flush meta so snapshot is consistent
-			await this.meta.saveNow();
-
+			await this.meta.saveNow(); // flush meta for consistency
 			await this.wasm.save(filepath);
 			if (this.vecFd) await this.vecFd.sync();
 		});
 	}
 
-	async load(filepath: string) {
+	/**
+	 * 从文件加载索引快照（WASM 索引），并确保向量文件/缓存可用。
+	 * Load index snapshot (WASM index) and ensure vector store/cache is ready.
+	 */
+	public async load(filepath: string): Promise<void> {
 		return this.withLock(async () => {
 			if (!this.isReady) await this.init();
 			await this.wasm.load(filepath);
@@ -640,7 +455,18 @@ export class MiniVectorDB {
 		});
 	}
 
-	getStats() {
+	/**
+	 * 获取数据库状态信息（方便调试/监控）。
+	 * Get DB stats (useful for debugging/monitoring).
+	 */
+	public getStats(): {
+		items: number;
+		vectorStore: string;
+		capacity: number | undefined;
+		metaPath: string;
+		preloadVectors: boolean;
+		wasmMaxEf?: number;
+	} {
 		return {
 			items: this.meta.items.count(),
 			vectorStore: this.vecPath,
@@ -651,7 +477,11 @@ export class MiniVectorDB {
 		};
 	}
 
-	async close() {
+	/**
+	 * 关闭数据库：释放文件句柄、关闭元数据存储。
+	 * Close DB: release file handles and metadata store.
+	 */
+	public async close(): Promise<void> {
 		return this.withLock(async () => {
 			await this.meta.close();
 			if (this.vecFd) {
@@ -660,5 +490,285 @@ export class MiniVectorDB {
 			}
 			this.vecCache = null;
 		});
+	}
+
+	// 串行化所有操作，避免并发读写导致数据错乱
+	// Serialize ops to avoid corruption from concurrent reads/writes.
+	private opLock: Promise<void> = Promise.resolve();
+	private async withLock<T>(fn: () => Promise<T> | T): Promise<T> {
+		let release!: () => void;
+		const next = new Promise<void>((r) => (release = r));
+		const prev = this.opLock;
+		this.opLock = prev.then(() => next);
+		await prev;
+		try {
+			return await fn();
+		} finally {
+			release();
+		}
+	}
+
+	// =========================
+	// Private helpers (私有辅助)
+	// =========================
+
+	private dim(): number {
+		return this.config.dim || Number(process.env.VECTOR_DIM ?? 0) || 384;
+	}
+
+	private bytesPerVec(): number {
+		return this.dim() * 4;
+	}
+
+	private capacity(): number {
+		return (
+			this.config.capacity ||
+			Number(process.env.HNSW_CAPACITY ?? 0) ||
+			1_200_000
+		);
+	}
+
+	private maxAnnK(): number {
+		const fromCfg = this.config.maxAnnK;
+		const fromEnv = process.env.MAX_ANN_K ? Number(process.env.MAX_ANN_K) : 0;
+		let cap = (fromCfg ?? fromEnv) || 10_000;
+
+		if (this.wasmMaxEf > 0) cap = Math.min(cap, this.wasmMaxEf);
+
+		if (cap <= 0) cap = 1;
+		return cap;
+	}
+
+	// normalize vectors so: stored F32 == quantized I8 semantics
+	private normalizeF32InPlace(v: Float32Array): Float32Array {
+		let normSq = 0;
+		for (let i = 0; i < v.length; i++) normSq += v[i] * v[i];
+		if (normSq <= 0) return v;
+		const inv = 1 / Math.sqrt(normSq);
+		for (let i = 0; i < v.length; i++) v[i] *= inv;
+		return v;
+	}
+
+	private quantizeToI8(v: Float32Array): Int8Array {
+		const out = new Int8Array(v.length);
+		for (let i = 0; i < v.length; i++) {
+			let x = v[i];
+			if (x > 1) x = 1;
+			else if (x < -1) x = -1;
+
+			let q = Math.round(x * 127);
+			if (q > 127) q = 127;
+			else if (q < -127) q = -127;
+
+			out[i] = q;
+		}
+		return out;
+	}
+
+	private l2SqF32(a: Float32Array, b: Float32Array): number {
+		let s = 0;
+		for (let i = 0; i < a.length; i++) {
+			const d = a[i] - b[i];
+			s += d * d;
+		}
+		return s;
+	}
+
+	private async ensureVectorStoreReady(): Promise<void> {
+		if (this.vecFd) return;
+
+		const dir = path.dirname(this.vecPath);
+		if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+
+		const exists = fs.existsSync(this.vecPath);
+		this.vecFd = await fs.promises.open(this.vecPath, exists ? "r+" : "w+");
+
+		if (this.config.preloadVectors && exists) {
+			this.vecCache = await fs.promises.readFile(this.vecPath);
+		}
+	}
+
+	private ensureCacheCapacity(minBytes: number) {
+		if (!this.config.preloadVectors) return;
+
+		if (!this.vecCache) {
+			this.vecCache = Buffer.allocUnsafe(minBytes);
+			this.vecCache.fill(0);
+			return;
+		}
+
+		if (this.vecCache.length < minBytes) {
+			const old = this.vecCache;
+			const next = Buffer.allocUnsafe(minBytes);
+			old.copy(next, 0, 0, old.length);
+			next.fill(0, old.length);
+			this.vecCache = next;
+		}
+	}
+
+	private async writeF32VectorsContiguous(
+		startInternalId: number,
+		vectors: Float32Array[],
+	): Promise<void> {
+		await this.ensureVectorStoreReady();
+		const fd = this.vecFd!;
+		const bpv = this.bytesPerVec();
+		const totalBytes = vectors.length * bpv;
+		const pos = startInternalId * bpv;
+
+		const buf = Buffer.allocUnsafe(totalBytes);
+		for (let i = 0; i < vectors.length; i++) {
+			const v = vectors[i];
+			const slice = Buffer.from(v.buffer, v.byteOffset, v.byteLength);
+			slice.copy(buf, i * bpv, 0, bpv);
+		}
+
+		const { bytesWritten } = await fd.write(buf, 0, totalBytes, pos);
+		if (bytesWritten !== totalBytes) {
+			throw new Error(
+				`Vector store bulk write failed. bytesWritten=${bytesWritten}, total=${totalBytes}`,
+			);
+		}
+
+		if (this.config.preloadVectors) {
+			this.ensureCacheCapacity(pos + totalBytes);
+			this.vecCache!.set(buf, pos);
+		}
+	}
+
+	private async writeF32Vector(
+		internalId: number,
+		v: Float32Array,
+	): Promise<void> {
+		await this.writeF32VectorsContiguous(internalId, [v]);
+	}
+
+	private async readF32Vectors(
+		internalIds: number[],
+	): Promise<Map<number, Float32Array>> {
+		await this.ensureVectorStoreReady();
+		const fd = this.vecFd!;
+		const dim = this.dim();
+		const bpv = this.bytesPerVec();
+
+		const out = new Map<number, Float32Array>();
+		if (internalIds.length === 0) return out;
+
+		// 预加载模式：直接从内存缓存取
+		// Preload mode: read from memory cache.
+		if (this.config.preloadVectors && this.vecCache) {
+			for (const id of internalIds) {
+				const pos = id * bpv;
+				if (pos + bpv > this.vecCache.length) continue;
+
+				const dv = new DataView(
+					this.vecCache.buffer,
+					this.vecCache.byteOffset + pos,
+					bpv,
+				);
+				const v = new Float32Array(dim);
+				for (let i = 0; i < dim; i++) v[i] = dv.getFloat32(i * 4, true);
+				out.set(id, v);
+			}
+			return out;
+		}
+
+		// 非预加载：按连续段批量读，减少 syscall
+		// Non-preload: read contiguous spans to reduce syscalls.
+		const ids = Array.from(new Set(internalIds)).sort((a, b) => a - b);
+
+		let i = 0;
+		while (i < ids.length) {
+			const start = ids[i];
+			let end = start;
+
+			while (i + 1 < ids.length && ids[i + 1] === end + 1) {
+				i++;
+				end = ids[i];
+			}
+
+			const count = end - start + 1;
+			const pos = start * bpv;
+			const bytes = count * bpv;
+
+			const buf = Buffer.allocUnsafe(bytes);
+			const { bytesRead } = await fd.read(buf, 0, bytes, pos);
+
+			if (bytesRead !== bytes) {
+				throw new Error(
+					`Vector store short read. pos=${pos} need=${bytes} got=${bytesRead}`,
+				);
+			}
+
+			for (let j = 0; j < count; j++) {
+				const id = start + j;
+				const off = j * bpv;
+
+				const dv = new DataView(buf.buffer, buf.byteOffset + off, bpv);
+				const v = new Float32Array(dim);
+				for (let k = 0; k < dim; k++) v[k] = dv.getFloat32(k * 4, true);
+				out.set(id, v);
+			}
+
+			i++;
+		}
+
+		return out;
+	}
+
+	private async resolveVectorToF32(
+		vector: InsertItem["vector"],
+	): Promise<Float32Array> {
+		if (
+			typeof vector === "string" ||
+			vector instanceof Buffer ||
+			vector instanceof Uint8Array
+		) {
+			const v = await this.embedder.embed(vector);
+			return this.normalizeF32InPlace(v);
+		}
+		if (vector instanceof Float32Array) {
+			const v = new Float32Array(vector); // avoid mutating caller buffer
+			return this.normalizeF32InPlace(v);
+		}
+		const v = new Float32Array(vector);
+		return this.normalizeF32InPlace(v);
+	}
+
+	private ensureWithinCapacity(internalId: number) {
+		const cap = this.capacity();
+		if (internalId < 0 || internalId >= cap) {
+			throw new Error(
+				`Internal ID out of capacity. id=${internalId}, capacity=${cap}. ` +
+					`Increase HNSW_CAPACITY / config.capacity.`,
+			);
+		}
+	}
+
+	private ensureAllocWithinCapacity(start: number, n: number) {
+		const cap = this.capacity();
+		const endExclusive = start + n;
+		if (start < 0 || n <= 0 || endExclusive > cap) {
+			throw new Error(
+				`Capacity overflow. need [${start}, ${endExclusive}) but capacity=${cap}. ` +
+					`Increase HNSW_CAPACITY / config.capacity.`,
+			);
+		}
+	}
+
+	private async ensureResultsCapAtLeast(n: number) {
+		if (n <= 0) return;
+
+		if (this.wasmMaxEf > 0) {
+			n = Math.min(n, this.wasmMaxEf);
+		}
+
+		const cur = await this.wasm.getResultsCap();
+		if (cur >= n) return;
+
+		let next = cur > 0 ? cur : 1000;
+		while (next < n) next = next * 2;
+
+		await this.wasm.setResultsCap(next);
 	}
 }
