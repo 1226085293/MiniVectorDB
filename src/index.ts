@@ -32,6 +32,9 @@ export interface DBConfig {
 	vectorStorePath?: string;
 
 	rerankMultiplier?: number;
+
+	// ✅ 新增：WASM HNSW capacity（必须 >= 预计最大条目数）
+	capacity?: number;
 }
 
 export class MiniVectorDB {
@@ -133,16 +136,22 @@ export class MiniVectorDB {
 	async init() {
 		if (this.isReady) return;
 
-		const wasmConfig = {
-			dim: this.config.dim || Number(process.env.VECTOR_DIM ?? 0) || 384,
-			m: this.config.m || Number(process.env.HNSW_M ?? 0) || 16,
-			ef:
-				this.config.ef_construction || Number(process.env.HNSW_EF ?? 0) || 100,
-			efSearch:
-				this.config.ef_search || Number(process.env.HNSW_EF_SEARCH ?? 0) || 50,
-		};
+		const dim = this.config.dim || Number(process.env.VECTOR_DIM ?? 0) || 384;
+		const m = this.config.m || Number(process.env.HNSW_M ?? 0) || 16;
+		const ef =
+			this.config.ef_construction || Number(process.env.HNSW_EF ?? 0) || 100;
 
-		await this.wasm.init(wasmConfig);
+		const efSearch =
+			this.config.ef_search || Number(process.env.HNSW_EF_SEARCH ?? 0) || 50;
+
+		// ✅ capacity：默认给 1_200_000（足够跑 1M + buffer）
+		// 你跑 perf_benchmark 时建议显式传入 capacity=N
+		const capacity =
+			this.config.capacity ||
+			Number(process.env.HNSW_CAPACITY ?? 0) ||
+			1_200_000;
+
+		await this.wasm.init({ dim, m, ef, efSearch, capacity });
 		await this.meta.ready();
 		await this.ensureVectorStoreReady();
 
@@ -181,7 +190,6 @@ export class MiniVectorDB {
 
 			await this.writeF32Vector(internalId, f32Vec);
 
-			// ✅ 如果 wasm 里没这个节点，就 insert（即使 meta 里已存在）
 			if (!this.wasm.hasNode(internalId)) {
 				this.wasm.insert(internalId, q8);
 			} else {
@@ -299,6 +307,7 @@ export class MiniVectorDB {
 			memory: (this.wasm as any)["memory"]?.buffer?.byteLength,
 			items: this.meta.items.count(),
 			vectorStore: this.vecPath,
+			capacity: this.config.capacity,
 		};
 	}
 

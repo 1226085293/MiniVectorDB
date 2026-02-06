@@ -28,14 +28,20 @@ let visited_stamp: i32 = 1;
 // --- HEAP BUFFERS (REUSED, NO GC) ---
 const MAX_EF: i32 = 4096;
 
+// candidates (min-heap)
 let cand_ids_ptr: usize = 0; // i32[MAX_EF]
 let cand_dist_ptr: usize = 0; // f32[MAX_EF]
 
+// results (max-heap, worst at root)
 let res_ids_ptr: usize = 0; // i32[MAX_EF]
 let res_dist_ptr: usize = 0; // f32[MAX_EF]
 
+// output buffers (closest first)
 let out_ids_ptr: usize = 0; // i32[MAX_EF]
 let out_dist_ptr: usize = 0; // f32[MAX_EF]
+
+// marks for partial extraction (no alloc in hot path)
+let used_mark_ptr: usize = 0; // u8[MAX_EF]
 
 // neighbor selection scratch
 let sel_ids_ptr: usize = 0; // i32[MAX_EF]
@@ -97,7 +103,6 @@ function cand_push(size: i32, id: i32, dist: f32): i32 {
 		cand_swap(i, p);
 		i = p;
 	}
-
 	return size;
 }
 
@@ -178,7 +183,6 @@ function res_push(size: i32, id: i32, dist: f32): i32 {
 		res_swap(i, p);
 		i = p;
 	}
-
 	return size;
 }
 
@@ -220,11 +224,38 @@ function res_pop(size: i32): i32 {
 		res_swap(i, largest);
 		i = largest;
 	}
-
 	return size;
 }
 
-function res_to_sorted(size: i32): i32 {
+// replace root (worst) with better element and sift-down (faster than pop+push)
+function res_replace_root(size: i32, id: i32, dist: f32): void {
+	store<i32>(res_ids_ptr + 0, id);
+	store<f32>(res_dist_ptr + 0, dist);
+
+	let i: i32 = 0;
+	while (true) {
+		let l = (i << 1) + 1;
+		if (l >= size) break;
+		let r = l + 1;
+
+		let largest = l;
+		let d_l = load<f32>(res_dist_ptr + <usize>l * 4);
+		if (r < size) {
+			let d_r = load<f32>(res_dist_ptr + <usize>r * 4);
+			if (d_r > d_l) largest = r;
+		}
+
+		let d_large = load<f32>(res_dist_ptr + <usize>largest * 4);
+		let d_i = load<f32>(res_dist_ptr + <usize>i * 4);
+		if (d_i >= d_large) break;
+
+		res_swap(i, largest);
+		i = largest;
+	}
+}
+
+// full heap-sort (used only for SEARCH results)
+function res_to_sorted_full(size: i32): i32 {
 	let n = size;
 	for (let i = n - 1; i >= 0; i--) {
 		size = res_pop(size);
@@ -232,6 +263,42 @@ function res_to_sorted(size: i32): i32 {
 		store<f32>(out_dist_ptr + <usize>i * 4, tmp_pop_dist);
 	}
 	return n;
+}
+
+// partial extraction: get k smallest from res arrays (O(k*ef)), k is tiny in build (<=64)
+// writes ascending order into out buffers.
+function res_extract_k_smallest_sorted(res_size: i32, k: i32): i32 {
+	if (k <= 0 || res_size <= 0) return 0;
+	if (k > res_size) k = res_size;
+	if (k > MAX_EF) k = MAX_EF;
+
+	// mark clear for [0..res_size)
+	for (let i: i32 = 0; i < res_size; i++) {
+		store<u8>(used_mark_ptr + <usize>i, 0);
+	}
+
+	for (let out: i32 = 0; out < k; out++) {
+		let best_idx: i32 = -1;
+		let best_dist: f32 = 99999999.0;
+
+		for (let i: i32 = 0; i < res_size; i++) {
+			if (load<u8>(used_mark_ptr + <usize>i) != 0) continue;
+			let d = load<f32>(res_dist_ptr + <usize>i * 4);
+			if (d < best_dist) {
+				best_dist = d;
+				best_idx = i;
+			}
+		}
+
+		if (best_idx < 0) break;
+		store<u8>(used_mark_ptr + <usize>best_idx, 1);
+
+		let id = load<i32>(res_ids_ptr + <usize>best_idx * 4);
+		store<i32>(out_ids_ptr + <usize>out * 4, id);
+		store<f32>(out_dist_ptr + <usize>out * 4, best_dist);
+	}
+
+	return k;
 }
 
 // --- INIT ---
@@ -248,8 +315,11 @@ export function init_index(capacity: i32): void {
 	cand_dist_ptr = alloc(<usize>MAX_EF * 4);
 	res_ids_ptr = alloc(<usize>MAX_EF * 4);
 	res_dist_ptr = alloc(<usize>MAX_EF * 4);
+
 	out_ids_ptr = alloc(<usize>MAX_EF * 4);
 	out_dist_ptr = alloc(<usize>MAX_EF * 4);
+
+	used_mark_ptr = alloc(<usize>MAX_EF); // u8
 
 	sel_ids_ptr = alloc(<usize>MAX_EF * 4);
 
@@ -262,6 +332,9 @@ export function init_index(capacity: i32): void {
 		store<usize>(node_offsets_ptr + <usize>i * 4, 0);
 		store<i32>(visited_mark_ptr + <usize>i * 4, 0);
 	}
+	for (let i: i32 = 0; i < MAX_EF; i++) {
+		store<u8>(used_mark_ptr + <usize>i, 0);
+	}
 }
 
 function get_random_level(): i32 {
@@ -272,16 +345,28 @@ function get_random_level(): i32 {
 	return level;
 }
 
-// --- SEARCH LAYER ---
+// --- SEARCH LAYER (stable-quality core) ---
+// Always maintains full ef "best" set in res heap (quality is NOT reduced).
+// Export path:
+//  - For query search: full sort output
+//  - For build/insert: partial extract only (no full sort), but still based on full ef best set.
 function search_layer(
 	query_vec_ptr: usize,
 	entry_node: i32,
 	layer: i32,
 	ef: i32,
+	buildMode: bool,
+	target: i32,
 ): i32 {
+	if (ef <= 0) return 0;
 	if (ef > MAX_EF) ef = MAX_EF;
 
 	visited_next_stamp();
+
+	// frontier capacity slightly larger than ef improves convergence and stability
+	let cand_cap: i32 = ef * 2 + 32;
+	if (cand_cap > MAX_EF) cand_cap = MAX_EF;
+	if (cand_cap < ef) cand_cap = ef;
 
 	let cand_size: i32 = 0;
 	let res_size: i32 = 0;
@@ -297,11 +382,10 @@ function search_layer(
 		let curr_id = tmp_pop_id;
 		let curr_dist = tmp_pop_dist;
 
-		if (res_size >= ef && curr_dist > res_peek_worst(res_size)) {
-			break;
-		}
+		if (res_size >= ef && curr_dist > res_peek_worst(res_size)) break;
 
 		let curr_node_ptr = get_node_ptr(curr_id);
+		if (curr_node_ptr == 0) continue;
 
 		let runner_ptr = curr_node_ptr + 8;
 		for (let l = 0; l < layer; l++) {
@@ -314,6 +398,7 @@ function search_layer(
 
 		for (let i = 0; i < neighbor_count; i++) {
 			let neighbor_id = load<i32>(neighbors_start + <usize>i * 4);
+			if (neighbor_id < 0 || neighbor_id >= max_elements) continue;
 			if (visited_get(neighbor_id)) continue;
 
 			visited_set(neighbor_id);
@@ -321,24 +406,33 @@ function search_layer(
 			let d = dist_l2_sq(query_vec_ptr, get_vector_ptr(neighbor_id));
 
 			if (res_size < ef || d < res_peek_worst(res_size)) {
-				if (cand_size < ef) {
+				if (cand_size < cand_cap) {
 					cand_size = cand_push(cand_size, neighbor_id, d);
 				}
 
 				if (res_size < ef) {
 					res_size = res_push(res_size, neighbor_id, d);
 				} else {
-					let worst = res_peek_worst(res_size);
-					if (d < worst) {
-						res_size = res_pop(res_size);
-						res_size = res_push(res_size, neighbor_id, d);
+					if (d < res_peek_worst(res_size)) {
+						res_replace_root(res_size, neighbor_id, d);
 					}
 				}
 			}
 		}
 	}
 
-	return res_to_sorted(res_size);
+	if (!buildMode) {
+		return res_to_sorted_full(res_size);
+	}
+
+	// build: we only need a candidate pool for neighbor heuristic selection.
+	// IMPORTANT: pool extraction is from the FULL ef-best set in res heap (quality preserved).
+	let pool: i32 = target * 2;
+	if (pool < target) pool = target;
+	if (pool > ef) pool = ef;
+	if (pool > res_size) pool = res_size;
+
+	return res_extract_k_smallest_sorted(res_size, pool);
 }
 
 // --- Heuristic neighbor selection (diversity-aware) ---
@@ -375,6 +469,7 @@ function select_neighbors_heuristic(
 		}
 	}
 
+	// fill remaining from best list
 	if (sel_count < target) {
 		for (let i: i32 = 0; i < found && sel_count < target; i++) {
 			let cand_id = load<i32>(out_ids_ptr + <usize>i * 4);
@@ -431,7 +526,7 @@ function add_connection(src: i32, dst: i32, layer: i32): void {
 		}
 
 		let dst_dist = dist_l2_sq(src_vec, get_vector_ptr(dst));
-		if (dst_dist < worst_dist) {
+		if (dst_dist < worst_dist && worst_idx >= 0) {
 			store<i32>(neighbors_ptr + <usize>worst_idx * 4, dst);
 		}
 	}
@@ -439,6 +534,8 @@ function add_connection(src: i32, dst: i32, layer: i32): void {
 
 // --- INSERT (new id only) ---
 export function insert(id: i32, vector_data_offset: usize): void {
+	if (id < 0 || id >= max_elements) return;
+
 	let target_vec_ptr = get_vector_ptr(id);
 	memory.copy(target_vec_ptr, vector_data_offset, get_vector_size());
 
@@ -468,6 +565,7 @@ export function insert(id: i32, vector_data_offset: usize): void {
 	let curr_obj = entry_point_id;
 	let curr_dist = dist_l2_sq(target_vec_ptr, get_vector_ptr(curr_obj));
 
+	// Greedy descent
 	for (let l = max_level; l > level; l--) {
 		let changed = true;
 		while (changed) {
@@ -494,10 +592,19 @@ export function insert(id: i32, vector_data_offset: usize): void {
 		}
 	}
 
+	// Connect down
 	for (let l = level < max_level ? level : max_level; l >= 0; l--) {
-		let found = search_layer(target_vec_ptr, curr_obj, l, EF_CONSTRUCTION);
-
 		let target = l == 0 ? M_MAX0 : M;
+
+		let found = search_layer(
+			target_vec_ptr,
+			curr_obj,
+			l,
+			EF_CONSTRUCTION,
+			true,
+			target,
+		);
+
 		let picked = select_neighbors_heuristic(target_vec_ptr, found, target);
 
 		for (let i = 0; i < picked; i++) {
@@ -520,6 +627,7 @@ export function insert(id: i32, vector_data_offset: usize): void {
 
 // --- UPDATE VECTOR ONLY (no graph mutation) ---
 export function update_vector(id: i32, vector_data_offset: usize): void {
+	if (id < 0 || id >= max_elements) return;
 	let target_vec_ptr = get_vector_ptr(id);
 	memory.copy(target_vec_ptr, vector_data_offset, get_vector_size());
 }
@@ -536,6 +644,7 @@ export function search(query_vec_offset: usize, k: i32): i32 {
 	let curr_obj = entry_point_id;
 	let curr_dist = dist_l2_sq(query_vec_offset, get_vector_ptr(curr_obj));
 
+	// Greedy descent on upper layers
 	for (let l = max_level; l > 0; l--) {
 		let changed = true;
 		while (changed) {
@@ -565,7 +674,7 @@ export function search(query_vec_offset: usize, k: i32): i32 {
 	if (ef < k) ef = k;
 	if (ef > MAX_EF) ef = MAX_EF;
 
-	let found = search_layer(query_vec_offset, curr_obj, 0, ef);
+	let found = search_layer(query_vec_offset, curr_obj, 0, ef, false, 0);
 
 	let out_count = found < k ? found : k;
 	if (out_count > 1000) out_count = 1000;

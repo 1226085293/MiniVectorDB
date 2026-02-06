@@ -15,6 +15,7 @@ export class WasmBridge {
 		m: number;
 		ef: number;
 		efSearch?: number;
+		capacity?: number;
 	} | null = null;
 
 	constructor() {}
@@ -24,6 +25,7 @@ export class WasmBridge {
 		m: number;
 		ef: number;
 		efSearch?: number;
+		capacity?: number;
 	}) {
 		const wasmBuffer = fs.readFileSync(WASM_PATH);
 
@@ -54,7 +56,10 @@ export class WasmBridge {
 			}
 		}
 
-		this.wasmModule.init_index(10000);
+		// ✅ 关键修复：init_index(capacity) 必须 >= 最大 internalId + 1，否则会 OOB
+		const cap = config?.capacity ?? 10000;
+		this.wasmModule.init_index(cap);
+
 		console.log(
 			"WASM Initialized. Memory size:",
 			this.memory.buffer.byteLength,
@@ -68,11 +73,6 @@ export class WasmBridge {
 		return ptr;
 	}
 
-	/**
-	 * ✅ 兼容：旧 wasm 可能还没导出 has_node（比如你忘了重新 build wasm）
-	 * - 若存在 has_node：精确判断
-	 * - 若不存在：保守返回 false（会走 insert，至少不再报错）
-	 */
 	hasNode(id: number): boolean {
 		if (typeof this.wasmModule.has_node === "function") {
 			return !!this.wasmModule.has_node(id);
@@ -148,6 +148,7 @@ export class WasmBridge {
 			}
 		}
 
+		// ✅ load_index 内部会 init_index(dump_max_elements)，所以这里不用担心 capacity
 		const ptr = this.wasmModule.alloc(buf.length);
 		new Uint8Array(this.memory.buffer, ptr, buf.length).set(buf);
 		this.wasmModule.load_index(ptr, buf.length);
