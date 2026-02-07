@@ -15,7 +15,8 @@
 		"build:ts": "tsc",
 		"build": "npm run asbuild && npm run build:ts",
 		"start": "ts-node src/api/server.ts",
-		"test": "ts-node tests/test.ts"
+		"test": "ts-node tests/test.ts",
+		"generate-md": "node mdg -e ts json -d ./assembly ./src ./asconfig.json ./tsconfig.json"
 	},
 	"dependencies": {
 		"@assemblyscript/loader": "^0.27.0",

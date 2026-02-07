@@ -3,6 +3,8 @@ import { spawn } from "child_process";
 import path from "path";
 import dotenv from "dotenv";
 import net from "net";
+import os from "os";
+import fs from "fs";
 
 // 加载本地 .env 配置
 dotenv.config({ path: path.join(__dirname, "../.env") });
@@ -54,11 +56,22 @@ async function waitExitOrKill(proc: any, timeoutMs: number) {
 }
 
 async function main() {
-	console.log("--- API TEST START ---");
+	console.log("--- API TEST START (v2 API) ---");
 
 	const TEST_PORT = await getAvailablePort();
 	console.log(`Using port: ${TEST_PORT}`);
-	console.log(`Using VECTOR_DIM: ${process.env.VECTOR_DIM || "384 (default)"}`);
+
+	// ✅ 这个测试走“数值向量直传”，所以 dim 取 env 或默认 384
+	const vectorDim = parseInt(process.env.VECTOR_DIM || "384", 10);
+	console.log(`Using VECTOR_DIM: ${vectorDim}`);
+
+	// ✅ 用临时目录，避免污染 data/
+	const storageDir = path.join(
+		os.tmpdir(),
+		`minivectordb-api-test-${Date.now()}`,
+	);
+	fs.mkdirSync(storageDir, { recursive: true });
+	console.log(`Using storage dir: ${storageDir}`);
 
 	const serverPath = path.join(__dirname, "../src/api/server.ts");
 	const cmd = process.platform === "win32" ? "npx.cmd" : "npx";
@@ -71,6 +84,16 @@ async function main() {
 			API_PORT: TEST_PORT.toString(),
 			API_HOST: "127.0.0.1",
 			NODE_ENV: "test",
+
+			// ✅ v2 server.ts 读取 MINIVECTOR_STORAGE_DIR
+			MINIVECTOR_STORAGE_DIR: storageDir,
+
+			// ✅ 强制维度匹配（MiniVectorDB.open 会读 VECTOR_DIM）
+			VECTOR_DIM: String(vectorDim),
+
+			// ✅ 避免用户本地 .env 把它切到 clip 模型导致 dim 推断冲突
+			// 这里强制 text 模型（只影响“字符串输入”，我们测试数值向量不依赖它）
+			MODEL_NAME: process.env.MODEL_NAME || "Xenova/all-MiniLM-L6-v2",
 		},
 	});
 
@@ -129,16 +152,16 @@ async function main() {
 		process.exit(1);
 	}
 
-	const vectorDim = parseInt(process.env.VECTOR_DIM || "384", 10);
-
 	try {
-		console.log(`Testing /insert with ${vectorDim} dim vector...`);
+		console.log(`Testing /insert with ${vectorDim} dim numeric vector...`);
+
+		// ✅ v2: /insert body uses { id, input, metadata }
 		const insertResp = await fetch(`${serverUrl}/insert`, {
 			method: "POST",
 			headers: { "Content-Type": "application/json" },
 			body: JSON.stringify({
 				id: "api-test-1",
-				vector: new Array(vectorDim).fill(0.1),
+				input: new Array(vectorDim).fill(0.1),
 				metadata: { type: "api-test" },
 			}),
 		});
@@ -150,11 +173,22 @@ async function main() {
 		}
 
 		console.log("Testing /search ...");
+
+		// ✅ v2: /search body uses { query, topK, filter }
 		const searchResp = await fetch(`${serverUrl}/search`, {
 			method: "POST",
 			headers: { "Content-Type": "application/json" },
-			body: JSON.stringify({ vector: new Array(vectorDim).fill(0.1), k: 1 }),
+			body: JSON.stringify({
+				query: new Array(vectorDim).fill(0.1),
+				topK: 1,
+			}),
 		});
+
+		if (searchResp.status !== 200) {
+			const errData = await searchResp.json().catch(() => ({}));
+			console.error("Search failed:", errData);
+			throw new Error("API Search Failed");
+		}
 
 		const searchData: any = await searchResp.json();
 
@@ -164,6 +198,11 @@ async function main() {
 			console.error("Search results:", searchData);
 			throw new Error("API Search mismatch");
 		}
+
+		// (可选) 测一下 /stats 不挂
+		const statsResp = await fetch(`${serverUrl}/stats`);
+		const stats = await statsResp.json().catch(() => ({}));
+		console.log("[stats endpoint]", stats);
 	} catch (e) {
 		console.error("❌ API TEST FAILED:", e);
 		process.exitCode = 1;
@@ -175,6 +214,11 @@ async function main() {
 
 		// ✅ 限时等待 server 退出，超时就杀树（否则 test 永远挂着）
 		await waitExitOrKill(serverProcess, 8000);
+
+		// ✅ best-effort 清理临时目录
+		try {
+			fs.rmSync(storageDir, { recursive: true, force: true });
+		} catch {}
 
 		process.exit(process.exitCode ?? 0);
 	}

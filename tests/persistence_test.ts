@@ -1,44 +1,77 @@
 import { MiniVectorDB } from "../src/index";
 import path from "path";
 import fs from "fs";
-
-const DUMP_PATH = path.join(process.cwd(), "data/persistence_dump");
-const META_PATH = path.join(process.cwd(), "data/persistence_meta.json");
+import os from "os";
 
 async function main() {
-	console.log("--- PERSISTENCE TEST START ---");
+	console.log("--- PERSISTENCE TEST START (v2 API) ---");
 
-	// Clean up
-	if (fs.existsSync(DUMP_PATH)) fs.unlinkSync(DUMP_PATH);
-	if (fs.existsSync(META_PATH)) fs.unlinkSync(META_PATH);
+	// 用临时目录，避免污染项目 data/
+	const storageDir = path.join(
+		os.tmpdir(),
+		`minivectordb-persist-${Date.now()}`,
+	);
+	if (!fs.existsSync(storageDir)) fs.mkdirSync(storageDir, { recursive: true });
 
-	// 1. Save data
+	const dumpPath = path.join(storageDir, "dump.bin");
+	const metaPath = path.join(storageDir, "metadata.json");
+	const vecPath = path.join(storageDir, "vectors.f32.bin");
+
+	// Clean up (如果目录复用时)
+	for (const p of [dumpPath, metaPath, vecPath]) {
+		if (fs.existsSync(p)) fs.unlinkSync(p);
+	}
+
+	// 1) Save data
 	console.log("Stage 1: Inserting and Saving...");
-	const db1 = new MiniVectorDB({ metaDbPath: META_PATH });
-	await db1.init();
+	const db1 = await MiniVectorDB.open({
+		storageDir,
+		// 默认模型 + dim=384 就够；如果你想更确定可显式写 dim
+		dim: 384,
+		mode: "balanced",
+		capacity: 10000,
+		preloadVectors: false,
+	});
 
-	// Use a unique vector to ensure search accuracy
+	console.log("[stats]", db1.getStats());
+
+	// 使用“唯一”的向量，降低碰撞/平局概率
 	const vec = new Array(384).fill(0).map((_, i) => i / 384);
+
 	await db1.insert({
 		id: "persist-1",
-		vector: vec,
+		input: vec, // v2: input
 		metadata: { info: "saved" },
 	});
 
-	await db1.save(DUMP_PATH);
+	// v2 save 默认写 storageDir/dump.bin（你也可传路径）
+	await db1.save();
 	await db1.close();
 	console.log("Data saved and DB closed.");
 
-	// 2. Load data
+	// 2) Load data
 	console.log("\nStage 2: Loading and Verifying...");
-	const db2 = new MiniVectorDB({ metaDbPath: META_PATH });
-	await db2.init();
-	await db2.load(DUMP_PATH);
+	const db2 = await MiniVectorDB.open({
+		storageDir,
+		dim: 384,
+		mode: "balanced",
+		capacity: 10000,
+		preloadVectors: false,
+	});
 
-	// Important: check if meta load worked
+	console.log("[stats after reopen]", db2.getStats());
+
+	// 重要：open 内部已经 try load()，这里可选再显式 load() 一次（幂等）
+	await db2.load();
+
 	console.log(`MetaDB has ${db2.getStats().items} items.`);
+	console.log(
+		`Files exist? dump=${fs.existsSync(dumpPath)} meta=${fs.existsSync(
+			metaPath,
+		)} vec=${fs.existsSync(vecPath)}`,
+	);
 
-	const results = await db2.search(vec, 1);
+	const results = await db2.search(vec, { topK: 1 }); // v2: search(query, {topK})
 	console.log("Loaded Search Results:", JSON.stringify(results, null, 2));
 
 	if (results.length > 0 && results[0].id === "persist-1") {
@@ -49,6 +82,7 @@ async function main() {
 	}
 
 	await db2.close();
+	console.log("--- PERSISTENCE TEST END ---");
 }
 
 main().catch((e) => {

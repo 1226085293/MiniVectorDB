@@ -1,56 +1,78 @@
-# MiniVectorDB (WASM + HNSW, SIMD-optimized)
+# MiniVectorDB — Local Vector Database (WASM HNSW + SIMD + Optional Re-rank)
 
-A lightweight, self-hosted vector database built with **Node.js + AssemblyScript (WASM SIMD)**.  
-It uses an **HNSW** approximate nearest neighbor index for fast retrieval, plus an optional **exact re-rank** stage using stored float vectors.
+> 📖 **Read this document in other languages:**
+>
+> - **English** (this file)
+> - [中文文档](./README.zh-CN.md)
 
-- Default language: **English**
-- 中文版：see **[README.zh-CN.md](./README.zh-CN.md)**
+MiniVectorDB is a lightweight, self-hosted vector database for **Node.js**. It uses an **HNSW** (Approximate Nearest Neighbor) index implemented in **WASM (AssemblyScript)**, keeps **int8-quantized vectors** in WASM memory for fast recall, and optionally performs an **exact re-rank** using **float32 original vectors stored on disk** for better accuracy.
 
-## What is this?
-
-If you’ve never used a “vector database” before, think of it as:
-
-> Turn data (text / image / audio / etc.) into **vectors** (arrays of numbers).  
-> Similar items have vectors that are “close” to each other.  
-> A vector DB lets you quickly find the closest items to a query vector.
-
-This project provides:
-
-- A **library** (`MiniVectorDB`) you can use in Node.js
-- A simple **HTTP API server** (Fastify) with `/insert` and `/search`
+It’s a practical choice when you want **zero infrastructure**, **single-machine local persistence**, and a tunable trade-off between **latency / memory / quality**.
 
 ---
 
-## Features
+## Table of Contents
 
-- **HNSW index in WASM (AssemblyScript)** for fast approximate search
-- **SIMD-accelerated** int8 L2 distance inside WASM (when supported)
-- **Int8 quantized vectors** in WASM for speed/memory
-- **Float32 vector store on disk** for exact L2 re-ranking (better accuracy)
-- **Metadata store** via LokiJS (JSON on disk)
-- **Persistence**
-  - `dump.bin` stores the HNSW graph + quantized vectors
-  - `vectors.f32.bin` stores float vectors
-  - `metadata.json` stores external_id ↔ internal_id + metadata
+- [Why MiniVectorDB](#why-minivectordb)
+- [How It Works](#how-it-works)
+- [When to Use (and When Not)](#when-to-use-and-when-not)
+- [Install & Build](#install--build)
+- [Quick Start (Library Mode)](#quick-start-library-mode)
+- [HTTP API (Service Mode)](#http-api-service-mode)
+- [Persistence & File Layout](#persistence--file-layout)
+- [Environment Variables & Config](#environment-variables--config)
+- [Presets & Tuning Tips](#presets--tuning-tips)
+- [FAQ / Troubleshooting](#faq--troubleshooting)
+- [Project Structure](#project-structure)
+- [License](#license)
 
 ---
 
-## Suitable environments
+## Why MiniVectorDB
 
-### Runtime
+- **WASM HNSW ANN**: core search runs inside WASM with predictable performance characteristics.
+- **int8 vectors in memory**: stores quantized vectors in WASM memory to reduce RSS versus float32-in-RAM approaches.
+- **Optional float32 re-rank**: recall candidates with HNSW, then compute exact **L2 distance squared** against the original float32 vectors on disk.
+- **File-based persistence**: HNSW graph + quantized vectors are stored in `dump.bin`; raw vectors are stored as a contiguous binary file `vectors.f32.bin`.
 
-- **Node.js 18+ recommended** (WASM SIMD support is expected)
-- macOS / Linux / Windows
+---
 
-### Build tools
+## How It Works
 
-- `npm` (or pnpm/yarn if you adapt scripts)
+MiniVectorDB is a standard two-stage retrieval pipeline:
 
-### Hardware
+### 1) Recall (ANN: WASM + HNSW)
 
-- Any CPU works, but SIMD-capable CPUs improve performance.
+- On insert, MiniVectorDB resolves the input (text/image/vector) into a **float32 vector** and **L2-normalizes** it.
+- It also produces an **int8-quantized** copy and stores it inside WASM.
+- Queries run HNSW inside WASM and return a set of candidate `internal_id`s (approximate neighbors).
 
-> ⚠️ If your Node/WASM runtime does not support WASM SIMD, `build/release.wasm` may fail to instantiate.
+### 2) Re-rank (Exact: float32)
+
+- Original float32 vectors are stored in `vectors.f32.bin`.
+- MiniVectorDB loads the float32 vectors for the candidate set, computes **exact L2 distance squared**, re-sorts, and returns topK.
+
+> Key idea:
+>
+> - Recall speed is dominated by HNSW parameters and candidate pool size
+> - Re-rank cost grows with `candidate_count × dim` and IO
+> - Larger candidate pools improve recall but increase p95/p99 latency
+
+---
+
+## When to Use (and When Not)
+
+### Use MiniVectorDB when
+
+- You want **local / single-machine** semantic search with **no external vector DB**
+- You need better memory efficiency than `number[]`-based in-RAM scans in Node.js
+- You prefer an engineering-friendly compromise: **ANN recall + optional exact re-rank**
+
+### Avoid MiniVectorDB when
+
+- You require strict **exact nearest neighbor** for every query
+- You need distributed serving, multi-tenant isolation, replication/sharding, etc.
+- Your runtime environment cannot reliably support WASM (or SIMD)
 
 ---
 
@@ -61,260 +83,334 @@ npm install
 npm run build
 ```
 
-### Run the API server
+### Runtime requirements
+
+- Recommended: Node.js 18+ (Node 20+ is ideal)
+- If your Node/WASM runtime does not support WASM SIMD, `release.wasm` may fail to load (see FAQ).
+
+---
+
+## Quick Start (Library Mode)
+
+```ts
+import { MiniVectorDB } from "mini-vector-db";
+
+async function main() {
+	const db = await MiniVectorDB.open({
+		storageDir: "./data",
+		modelName: "Xenova/all-MiniLM-L6-v2",
+		mode: "balanced",
+		capacity: 200_000,
+		preloadVectors: false,
+	});
+
+	await db.insert({
+		id: "doc:1",
+		input: "Hello world",
+		metadata: { type: "doc" },
+	});
+
+	const results = await db.search("Hello", { topK: 5 });
+	console.log(results);
+
+	await db.save();
+	await db.close();
+}
+
+main().catch(console.error);
+```
+
+### Supported input types
+
+- `insert({ input })` accepts:
+  - text: `string`
+  - binary: `Buffer | Uint8Array` (for CLIP or your own convention)
+  - vectors: `number[] | Float32Array`
+
+- `search(query)` accepts the same input types.
+
+> Important: the index must be built and queried with the **same embedding model** and the **same vector dimensionality**.
+
+---
+
+## HTTP API (Service Mode)
+
+### Start the server
 
 ```bash
 npm start
 ```
 
-Server entry: `src/api/server.ts`
-
----
-
-## Configuration (.env)
-
-The server loads `.env` from the repo root.
-
-Common settings:
-
-| Env var            | Meaning                                                                     | Default                   |
-| ------------------ | --------------------------------------------------------------------------- | ------------------------- |
-| `API_HOST`         | bind host                                                                   | `127.0.0.1`               |
-| `API_PORT`         | server port                                                                 | `3000`                    |
-| `MODEL_NAME`       | embedding model name used by library (not required for API numeric vectors) | `Xenova/all-MiniLM-L6-v2` |
-| `VECTOR_DIM`       | vector dimension                                                            | `384`                     |
-| `HNSW_M`           | HNSW M (neighbors per layer)                                                | `16`                      |
-| `HNSW_EF`          | `efConstruction`                                                            | `100`                     |
-| `HNSW_EF_SEARCH`   | `efSearch`                                                                  | `50`                      |
-| `HNSW_CAPACITY`    | max elements reserved in index                                              | `1200000`                 |
-| `HNSW_RESULTS_CAP` | how many raw ANN candidates WASM returns at most                            | `1000`                    |
-| `MAX_ANN_K`        | cap for ANN candidates in library stage                                     | `10000`                   |
-| `HNSW_SEED`        | RNG seed for level assignment                                               | auto                      |
-
-### Dimension tips
-
-- If you use `Xenova/all-MiniLM-L6-v2` → DIM is usually **384**
-- If you use CLIP `Xenova/clip-vit-base-patch32` → DIM is usually **512**
-
-> The WASM config expects `DIM` to be a multiple of 4.
-
----
-
-## Data files
-
-By default the API uses:
-
-- `data/dump.bin` (HNSW dump)
-- `data/vectors.f32.bin` (Float32 vector store)
-- `data/metadata.json` (LokiJS metadata)
-
-On startup, server tries to load `dump.bin`. If load fails, it starts fresh.
-
----
-
-## HTTP API Guide (for people new to vector databases)
-
-### 1) You need vectors (embeddings) first
-
-This server’s `/insert` and `/search` expect **numeric vectors** (`number[]`) with length `VECTOR_DIM`.
-
-How do you get vectors?
-
-- Use an embedding model (OpenAI / local models / Xenova transformers, etc.)
-- The important rule: **insert vectors and query vectors must come from the same model + same dimension**
-
-If you don’t have embeddings yet, you can:
-
-- Generate them in your app and call this API, or
-- Use this project as a library (it can embed text/images locally via `@xenova/transformers`)
-
----
-
-### 2) Insert
-
-**POST** `/insert`
-
-Body:
+### POST `/insert`
 
 ```json
 {
-  "id": "doc:123",
-  "vector": [0.01, -0.02, ...],
-  "metadata": { "title": "Hello", "tag": "notes" }
+	"id": "doc:123",
+	"input": "any supported input (text/vector/binary)",
+	"metadata": { "tag": "notes" }
 }
 ```
 
-Example (curl):
-
-```bash
-curl -X POST http://127.0.0.1:3000/insert \
-  -H "content-type: application/json" \
-  -d '{
-    "id": "doc:123",
-    "vector": [0,0,0,0 /* ... must be VECTOR_DIM numbers ... */],
-    "metadata": { "type": "doc", "lang": "en" }
-  }'
-```
-
-Notes:
-
-- `id` is your external identifier (string)
-- If you insert the same `id` again, it updates the stored vector and **reconnects** neighbors in HNSW.
-
----
-
-### 3) Search
-
-**POST** `/search`
-
-Body:
+### POST `/search`
 
 ```json
 {
-  "vector": [0.01, -0.02, ...],
-  "k": 10,
-  "filter": { /* optional */ }
+	"query": "any supported input (text/vector/binary)",
+	"topK": 10,
+	"filter": { "metadata": { "tag": "notes" } }
 }
 ```
 
-Example:
+### POST `/save`
 
-```bash
-curl -X POST http://127.0.0.1:3000/search \
-  -H "content-type: application/json" \
-  -d '{
-    "vector": [0,0,0,0 /* ... VECTOR_DIM ... */],
-    "k": 5
-  }'
-```
+Persists metadata + dump. (`vectors.f32.bin` is written during inserts; `save` forces sync.)
 
-Response:
+### GET `/stats`
 
-```json
-{
-	"results": [{ "id": "doc:123", "score": 0.42, "metadata": { "type": "doc" } }]
-}
-```
+Returns basic info: mode/model/dim/items/capacity/wasmMaxEf.
 
-How to interpret `score`:
+### POST `/shutdown`
 
-- It is **L2 distance squared** (after exact re-rank using Float32 vectors)
-- **Smaller = more similar**
-
-#### Optional filter
-
-`filter` is passed to LokiJS `find()` internally. Practically, you’ll filter on stored `metadata`.
-
-Example idea (your exact query shape may vary depending on how you store metadata):
-
-```json
-{
-	"filter": { "metadata": { "type": "doc" } }
-}
-```
+Graceful shutdown for CI/testing, with a 6-second hard timeout as a fallback.
 
 ---
 
-### 4) Save index to disk
+## Persistence & File Layout
 
-**POST** `/save`
+Under `storageDir`:
 
-```bash
-curl -X POST http://127.0.0.1:3000/save
-```
+- `metadata.json`
+  - LokiJS store for `external_id ↔ internal_id` mapping + metadata
 
-This writes:
+- `vectors.f32.bin`
+  - contiguous float32 vector store
+  - offset = `internal_id * dim * 4`
 
-- `data/dump.bin` (HNSW graph dump)
-- metadata is already autosaved; vectors are flushed to disk
+- `dump.bin`
+  - WASM HNSW dump (graph structure + int8 vectors)
 
----
+Load behavior:
 
-### 5) Stats
-
-**GET** `/stats`
-
-```bash
-curl http://127.0.0.1:3000/stats
-```
-
-Returns number of items, paths, capacity, etc.
+- `MiniVectorDB.open()` runs `init()` and tries `load()` (missing dump is ignored)
+- `load()` optionally preloads `vectors.f32.bin` if `preloadVectors` is enabled
 
 ---
 
-### 6) Shutdown (testing/CI)
+## Environment Variables & Config
 
-**POST** `/shutdown`
+Your code uses two groups of environment variables:
 
-```bash
-curl -X POST http://127.0.0.1:3000/shutdown
-```
+1. **Server settings** (Fastify startup)
+2. **DB settings** (open/init/search strategy)
 
-The server replies first, then closes DB and exits (with a hard timeout fallback).
+> Precedence (DB settings):
+> explicit `opts` > environment variables > defaults / preset inference
 
----
+### 1) Server environment variables (`src/api/server.ts`)
 
-## Library usage (Node.js)
+| Env Var                  | Purpose              |                   Default | When it applies | Notes                                             |          |           |
+| ------------------------ | -------------------- | ------------------------: | --------------- | ------------------------------------------------- | -------- | --------- |
+| `API_HOST`               | bind address         |               `127.0.0.1` | startup         | use `0.0.0.0` for containers/LAN                  |          |           |
+| `API_PORT`               | server port          |                    `3000` | startup         |                                                   |          |           |
+| `MINIVECTOR_STORAGE_DIR` | DB data directory    |      `process.cwd()/data` | startup         | passed to `MiniVectorDB.open({ storageDir })`     |          |           |
+| `MODEL_NAME`             | embedding model      | `Xenova/all-MiniLM-L6-v2` | startup         | affects arch/dim inference                        |          |           |
+| `MINIVECTOR_MODE`        | preset mode          |                `balanced` | startup         | `fast                                             | balanced | accurate` |
+| `HNSW_CAPACITY`          | capacity limit       |               `1_200_000` | startup         | must be big enough for your dataset               |          |           |
+| `PRELOAD_VECTORS`        | preload vectors file |                       `0` | startup         | `1` to enable (higher RSS, lower IO tail latency) |          |           |
 
-If you don’t want to run an HTTP service, you can use the library directly.
-The library can accept:
+### 2) Library environment variables (`src/index.ts` → `resolveOpenConfig`)
 
-- vectors (`number[]` / `Float32Array`)
-- or raw inputs (`string` / `Buffer` / `Uint8Array`) and embed locally via `@xenova/transformers`
+| Env Var                  | Config field       | Purpose                   |                        Default | When it applies               | Requires rebuild                  |
+| ------------------------ | ------------------ | ------------------------- | -----------------------------: | ----------------------------- | --------------------------------- |
+| `MINIVECTOR_STORAGE_DIR` | `storageDir`       | data directory            |                       `./data` | on open                       | no                                |
+| `MODEL_NAME`             | `modelName`        | embedding model           |      `Xenova/all-MiniLM-L6-v2` | on open                       | **usually yes**                   |
+| `MINIVECTOR_MODE`        | `mode`             | preset mode               |                     `balanced` | on open                       | depends (see below)               |
+| `VECTOR_DIM`             | `dim`              | vector dimension          | inferred (text=384 / clip=512) | open/init                     | **yes**                           |
+| `HNSW_CAPACITY`          | `capacity`         | internal_id upper bound   |                    `1_200_000` | init/insert                   | not necessarily (see note)        |
+| `PRELOAD_VECTORS`        | `preloadVectors`   | preload `vectors.f32.bin` |                            `0` | load                          | no                                |
+| `HNSW_M`                 | `m`                | HNSW M                    |                         preset | init                          | **yes** (`dump.bin` not reusable) |
+| `HNSW_EF`                | `ef_construction`  | build efConstruction      |                         preset | init                          | **yes** (`dump.bin` not reusable) |
+| `BASE_EF_SEARCH`         | `baseEfSearch`     | efSearch baseline         |                         preset | query-time (dynamic)          | no                                |
+| `RERANK_MULTIPLIER`      | `rerankMultiplier` | annK = topK × multiplier  |                         preset | query-time                    | no                                |
+| `MAX_ANN_K`              | `maxAnnK`          | annK upper bound          |                         preset | query-time                    | no                                |
+| `HNSW_RESULTS_CAP`       | `resultsCap`       | WASM result buffer cap    |                         preset | init / may grow at query-time | no (but limited by WASM MAX_EF)   |
 
-Example:
+#### Practical “rebuild required?” rules
 
-```ts
-import { MiniVectorDB } from "mini-vector-db";
-
-const db = new MiniVectorDB({
-	dim: 384,
-	m: 16,
-	ef_construction: 100,
-	ef_search: 50,
-	capacity: 200_000,
-	resultsCap: 1000,
-	modelName: "Xenova/all-MiniLM-L6-v2",
-	modelArchitecture: "text",
-});
-
-await db.init();
-
-await db.insert({
-	id: "doc:1",
-	vector: "Hello world", // can be text (will embed)
-	metadata: { type: "doc" },
-});
-
-const results = await db.search("hello", 5);
-console.log(results);
-
-await db.save("./data/dump.bin");
-await db.close();
-```
+- **Rebuild required / old `dump.bin` cannot be reused**: `dim`, `m`, `ef_construction`, embedding model changes
+- **No rebuild (runtime-tunable)**: `baseEfSearch`, `rerankMultiplier`, `maxAnnK`, `resultsCap`, `preloadVectors`
+- `capacity`: increasing it doesn’t inherently require rebuilding, but you should keep a consistent storage layout and plan capacity up front.
 
 ---
 
-## Performance & capacity notes
+## Presets & Tuning Tips
 
-- `HNSW_CAPACITY` is a **hard limit**. If you exceed it, inserts will throw.
-- Disk usage for float vectors:
-  - `capacity * dim * 4 bytes`
-  - Example: `1,200,000 * 384 * 4 ≈ 1.84 GB`
+### Preset overview
 
-- RAM usage depends on:
-  - quantized vectors (`dim` bytes each)
-  - HNSW node graph (neighbors per node, level distribution)
-  - WASM memory growth
+- `fast`
+  - faster build, smaller candidate pool, low latency, lower recall
 
-For large capacities, plan for **multiple GB** disk and **significant RAM**.
+- `balanced`
+  - recommended default: better trade-off
+
+- `accurate`
+  - higher recall target; avoid overly large candidate pools that inflate p95/p99
+
+### Your query-time auto strategy
+
+- `efSearch = max(baseEfSearch, topK * 2)`
+- `annK = min(topK * rerankMultiplier, maxAnnK, wasmMaxEf)`
+- `resultsCap` grows automatically until it’s ≥ `annK`
+
+#### What to tune first
+
+- Want more accuracy: increase `RERANK_MULTIPLIER` or `BASE_EF_SEARCH`
+- Want lower latency: decrease `RERANK_MULTIPLIER` first, then `BASE_EF_SEARCH`
+- Want better index quality: increase `m` / `ef_construction` (requires rebuild)
 
 ---
 
-## Project structure
+## FAQ / Troubleshooting
 
-- `assembly/` — AssemblyScript HNSW + SIMD distance + custom allocator
-- `src/core/wasm-bridge.ts` — calls into WASM, manages scratch buffers, dump load/save
-- `src/storage/meta-db.ts` — LokiJS metadata mapping
-- `src/embedder.ts` — local embedding via `@xenova/transformers`
-- `src/api/server.ts` — Fastify HTTP API
+### 1) Will rebuilding the index “damage” existing data?
+
+Not magically, but your storage consists of three parts:
+
+- `metadata.json`: id mapping + metadata
+- `vectors.f32.bin`: float32 vectors
+- `dump.bin`: HNSW graph + quantized vectors (strongly coupled to build parameters)
+
+If you change `dim / m / ef_construction` or switch embedding models:
+
+- **old `dump.bin` is not reusable** (remove/backup and rebuild)
+- `vectors.f32.bin` may still exist, but if dim/model changed, those vectors are no longer semantically compatible—re-embed/rebuild is recommended.
+
+Safe workflow:
+
+- backup `storageDir`
+- remove `dump.bin`
+- rebuild from source data (or reinsert)
+
+---
+
+### 2) “It loads but returns nothing” / results look wrong
+
+Common causes:
+
+- index was built with a different embedding model than you’re querying with
+- dimension mismatch between configured `dim` and actual vectors
+- mixing “raw vectors” inserts with “text embedding” queries from a different model
+
+Check:
+
+- `/stats` (model/dim/mode)
+- ensure both insert and search use the same embedding source
+
+---
+
+### 3) Error: `Vector dimension mismatch`
+
+Fix:
+
+- for vector inputs: ensure length equals `dim`
+- for text/binary inputs: ensure the embedder output dimension matches `dim`
+  - you can avoid manual `VECTOR_DIM` and rely on inference from `modelName`
+
+---
+
+### 4) Error: `Database capacity exceeded / overflow`
+
+This means your `internal_id` reached the hard limit `capacity`.
+Fix:
+
+- reopen with a larger `capacity` (plan 2×–4× headroom)
+- rebuild or migrate storage as needed
+
+---
+
+### 5) Why don’t values above 4096 for `maxAnnK/resultsCap` work?
+
+Your WASM layer has a hard limit (MAX_EF=4096). Therefore:
+
+- `annK` is clamped by `wasmMaxEf`
+- `resultsCap` above that is pointless
+
+Recommendation:
+
+- document the 4096 cap
+- keep presets within 4096
+
+---
+
+### 6) High p95/p99 latency — how do I reduce it?
+
+Usually the candidate pool is too large.
+Steps:
+
+1. lower `RERANK_MULTIPLIER`
+2. lower `BASE_EF_SEARCH`
+3. enable `PRELOAD_VECTORS=1` to reduce IO tail latency (higher RSS)
+
+---
+
+### 7) Why is `score` smaller = more similar?
+
+MiniVectorDB returns **L2 distance squared** after exact re-rank:
+
+- **smaller is better**
+
+This differs from “cosine similarity larger is better” APIs. Since vectors are normalized, L2 and cosine are monotonic-related, but MiniVectorDB keeps L2^2 for simplicity and speed.
+
+---
+
+### 8) What does `PRELOAD_VECTORS=1` do?
+
+- loads `vectors.f32.bin` into RAM at `load()` time
+- re-rank reads from memory, reducing random disk IO
+- increases RSS proportional to vector file size
+
+---
+
+### 9) WASM SIMD load failure
+
+Likely:
+
+- Node too old
+- runtime lacks WASM SIMD support
+
+Fix:
+
+- upgrade Node (18+/20+)
+- provide a non-SIMD wasm build or fallback strategy and document it
+
+---
+
+### 10) Changing `MINIVECTOR_MODE` doesn’t seem to change anything
+
+Possible reasons:
+
+- env vars override the preset values (e.g., `HNSW_M`, `HNSW_EF`, `RERANK_MULTIPLIER`)
+- you changed build params but didn’t rebuild (still using old `dump.bin`)
+
+Debug:
+
+- log `db.cfg`
+- verify the final resolved config source (opts/env/preset)
+- rebuild after changing build params
+
+---
+
+## Project Structure
+
+- `assembly/`: AssemblyScript HNSW + distance kernels + allocator
+- `src/core/wasm-bridge.ts`: WASM bridge, efSearch/resultsCap control, dump IO
+- `src/storage/meta-db.ts`: LokiJS metadata store (external_id ↔ internal_id + metadata)
+- `src/embedder.ts`: local embedding (`@xenova/transformers`)
+- `src/index.ts`: core MiniVectorDB logic (open/insert/search/save/load)
+- `src/api/server.ts`: Fastify HTTP API
+
+---
+
+## License
+
+MIT
