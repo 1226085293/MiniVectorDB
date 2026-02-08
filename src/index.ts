@@ -6,20 +6,30 @@ import path from "path";
 import fs from "fs";
 import dotenv from "dotenv";
 
-// ✅ 读取项目根目录的 .env（你也可以不配 .env，所有参数都能在 open() 里传）
+/**
+ * @zh-CN 从项目根目录读取 .env（可选）。你也可以在 open() 里直接传参数覆盖。
+ * @en Loads optional .env from project root. You can override everything via open().
+ */
 dotenv.config({ path: path.join(__dirname, "../.env") });
 
 /**
- * 三档预设：
- * - fast：更快、更省内存（召回更少）
- * - balanced：默认档，兼顾速度和效果
- * - accurate：更准（通常更慢）
+ * @zh-CN 三档一键预设：
+ * - fast：更省 CPU/内存，召回更少（更快）
+ * - balanced：默认档，速度与效果折中
+ * - accurate：更高召回/更稳，但通常更慢、更吃资源
+ *
+ * @en Three presets:
+ * - fast: lower CPU/memory, lower recall (faster)
+ * - balanced: default trade-off
+ * - accurate: higher recall/stability, usually slower & heavier
  */
 export type ModePreset = "fast" | "balanced" | "accurate";
 
 /**
- * 搜索结果：
- * - score 越小越相似（L2 距离平方）
+ * @zh-CN 搜索结果：
+ * - score 越小越相似（L2 距离平方；0 表示完全相同向量）
+ * @en Search result:
+ * - smaller score means more similar (squared L2 distance; 0 = identical vectors)
  */
 export interface SearchResult<TMeta = any> {
 	id: string;
@@ -28,8 +38,18 @@ export interface SearchResult<TMeta = any> {
 }
 
 /**
- * 插入条目：
- * - input 既可以是向量，也可以是文本/图片（会自动 embed）
+ * @zh-CN 插入条目：
+ * - id：你的业务主键（string）
+ * - input：支持 3 类输入：
+ *   1) Float32Array / number[]：你自己提供向量
+ *   2) string：文本（会自动 embedding）
+ *   3) Buffer/Uint8Array：图片/二进制（CLIP 模型会自动 embedding）
+ * @en Insert item:
+ * - id: your external primary key (string)
+ * - input supports:
+ *   1) Float32Array / number[]: raw vector provided by you
+ *   2) string: text (auto-embedded)
+ *   3) Buffer/Uint8Array: image/binary (auto-embedded for CLIP)
  */
 export interface InsertItem<TMeta = any> {
 	id: string;
@@ -38,9 +58,16 @@ export interface InsertItem<TMeta = any> {
 }
 
 /**
- * 搜索选项：
- * - topK：要返回多少条
- * - filter：可以用 Loki 的 query object，也可以用 predicate(metadata)=>boolean
+ * @zh-CN 搜索选项：
+ * - topK：返回前 K 条
+ * - filter：按 metadata 过滤（两种写法）
+ *   1) Loki query object（推荐，易序列化/易复用）
+ *   2) predicate(metadata) => boolean（灵活但不可序列化）
+ * @en Search options:
+ * - topK: return top K
+ * - filter: metadata filtering:
+ *   1) Loki query object (recommended; serializable/reusable)
+ *   2) predicate(metadata) => boolean (flexible; not serializable)
  */
 export interface SearchOptions<TMeta = any> {
 	topK?: number;
@@ -48,8 +75,27 @@ export interface SearchOptions<TMeta = any> {
 }
 
 /**
- * 打开数据库时的配置：
- * 你只需要关心少量字段（storageDir/modelName/mode），其他都可以不填。
+ * @zh-CN 打开数据库的配置：
+ * 你通常只需要关心：
+ * - storageDir：数据目录（默认 ./data）
+ * - modelName：embedding 模型（默认 MiniLM 文本模型）
+ * - mode：fast / balanced / accurate（默认 balanced）
+ *
+ * 会在 storageDir 里生成/使用：
+ * - metadata.json：id/metadata 映射与索引
+ * - vectors.f32.bin：原始 Float32 向量（用于精排，保证准确）
+ * - dump.bin：HNSW 图结构 + 量化向量（用于快速召回）
+ *
+ * @en Open options (minimal mental model):
+ * You usually only care about:
+ * - storageDir: data dir (default ./data)
+ * - modelName: embedding model (default MiniLM text model)
+ * - mode: fast / balanced / accurate (default balanced)
+ *
+ * Files under storageDir:
+ * - metadata.json: id/metadata mapping
+ * - vectors.f32.bin: raw Float32 vectors (used for rerank accuracy)
+ * - dump.bin: HNSW graph + quantized vectors (used for fast recall)
  */
 export interface DBOpenOptions {
 	/**
@@ -62,20 +108,31 @@ export interface DBOpenOptions {
 	storageDir?: string;
 
 	/**
-	 * 用于自动 embedding 的模型名
+	 * @zh-CN 自动 embedding 的模型名：
 	 * - text 默认：Xenova/all-MiniLM-L6-v2（384 维）
 	 * - clip 示例：Xenova/clip-vit-base-patch32（512 维）
+	 * @en Embedding model name:
+	 * - default text: Xenova/all-MiniLM-L6-v2 (384 dim)
+	 * - example CLIP: Xenova/clip-vit-base-patch32 (512 dim)
 	 */
 	modelName?: string;
 	modelArchitecture?: "text" | "clip";
 
-	/**
-	 * 一键档位：fast / balanced / accurate
-	 */
+	/** @zh-CN 一键预设档位 | @en Preset mode */
 	mode?: ModePreset;
 
 	/**
-	 * 高级项（可不填，系统会自动推导）
+	 * @zh-CN 高级项（可选）：
+	 * - dim：向量维度（默认按模型推导）
+	 * - capacity：最多容纳多少条（默认 1_200_000）
+	 * - preloadVectors：是否把 vectors.f32.bin 预读到内存（更快但更吃内存）
+	 * - seed：随机种子（便于复现）
+	 *
+	 * @en Advanced (optional):
+	 * - dim: vector dimension (inferred by model by default)
+	 * - capacity: max items (default 1_200_000)
+	 * - preloadVectors: preload vectors.f32.bin into RAM (faster, more memory)
+	 * - seed: RNG seed (reproducibility)
 	 */
 	dim?: number;
 	capacity?: number;
@@ -83,15 +140,21 @@ export interface DBOpenOptions {
 	seed?: number;
 
 	/**
-	 * HNSW 高级参数（不懂就别填）
-	 * 注意：这些参数改变后通常需要重建索引才会完全生效
+	 * @zh-CN HNSW 建库参数（不懂可不填）：
+	 * - m / ef_construction 影响“建库质量 vs 建库速度/内存”
+	 * - 修改后通常需要重建索引才能充分生效
+	 *
+	 * @en HNSW build params (optional):
+	 * - m / ef_construction trade off build quality vs build speed/memory
+	 * - changes typically require rebuilding to fully take effect
 	 */
 	m?: number;
 	ef_construction?: number;
 }
 
 /**
- * 内部最终配置：对外不暴露（避免吓到用户）
+ * @zh-CN 内部最终配置（对外不暴露，避免术语打扰普通用户）
+ * @en Internal resolved config (kept private to avoid confusing casual users)
  */
 type InternalResolvedConfig = Required<
 	Pick<DBOpenOptions, "storageDir" | "modelName" | "mode" | "preloadVectors">
@@ -101,11 +164,23 @@ type InternalResolvedConfig = Required<
 	capacity: number;
 	seed?: number;
 
-	// HNSW build 参数
+	// HNSW build params
 	m: number;
 	ef_construction: number;
 
-	// 查询策略（运行时可变；用户一般不需要理解）
+	/**
+	 * @zh-CN 查询策略（运行时可调）：
+	 * - baseEfSearch：HNSW 搜索宽度基线（越大召回越高但更慢）
+	 * - rerankMultiplier：召回候选数 = topK * multiplier（用于后续精排）
+	 * - maxAnnK：召回候选上限（受 WASM MAX_EF 限制）
+	 * - resultsCap：WASM 结果缓冲区上限（<= MAX_EF）
+	 *
+	 * @en Query strategy (runtime-tunable):
+	 * - baseEfSearch: HNSW search width baseline (bigger = higher recall, slower)
+	 * - rerankMultiplier: candidates = topK * multiplier (for rerank)
+	 * - maxAnnK: upper bound (limited by WASM MAX_EF)
+	 * - resultsCap: WASM results buffer cap (<= MAX_EF)
+	 */
 	baseEfSearch: number;
 	rerankMultiplier: number;
 	maxAnnK: number;
@@ -113,20 +188,20 @@ type InternalResolvedConfig = Required<
 };
 
 /**
- * ✅ 根据模型大致推导维度：
- * - text -> 384
- * - clip -> 512
- *
- * 你也可以显式传 dim 覆盖它。
+ * @zh-CN 通过模型大致推断维度：text=384，clip=512；也可以用 opts.dim 覆盖。
+ * @en Infer dim from model family: text=384, clip=512; can be overridden by opts.dim.
  */
 function inferDimFromModel(modelName: string, arch: "text" | "clip"): number {
 	return arch === "clip" ? 512 : 384;
 }
 
 /**
- * ✅ 推导模型架构：
- * - 你显式传 arch 就用你的
- * - 否则：modelName 里包含 clip 就当 clip，否则当 text
+ * @zh-CN 推断模型架构：
+ * - 优先使用用户显式指定的 modelArchitecture
+ * - 否则：modelName 含 "clip" 则认为是 CLIP，否则认为是 text
+ * @en Resolve architecture:
+ * - prefer explicit modelArchitecture
+ * - else: if modelName contains "clip" => CLIP, otherwise text
  */
 function resolveArch(
 	modelName?: string,
@@ -138,13 +213,19 @@ function resolveArch(
 }
 
 /**
- * ✅ 三档预设参数（给不想研究 HNSW 的人用）
- *
+ * @zh-CN 预设参数（面向普通用户的“无需懂 HNSW”版本）。
  * 说明：
- * - m / ef_construction 影响建库质量与速度（一般需要重建才能发挥完整效果）
- * - baseEfSearch / rerankMultiplier 影响查询速度与准确率（运行时可动态调）
+ * - m / ef_construction：影响建库质量、内存与构建速度（通常需重建）
+ * - baseEfSearch / rerankMultiplier：影响查询召回与延迟（可运行时调）
  *
- * ⚠️ WASM 侧 MAX_EF=4096，因此 maxAnnK/resultsCap 不建议超过 4096
+ * ⚠️ WASM 侧 MAX_EF=4096，因此候选池/缓冲区不建议超过 4096。
+ *
+ * @en Presets for non-experts.
+ * Notes:
+ * - m / ef_construction: affects build quality/memory/speed (often requires rebuild)
+ * - baseEfSearch / rerankMultiplier: affects query recall/latency (runtime-tunable)
+ *
+ * ⚠️ WASM MAX_EF=4096, so avoid pushing candidates/buffers beyond 4096.
  */
 function resolvePreset(mode: ModePreset) {
 	switch (mode) {
@@ -189,8 +270,11 @@ function resolvePreset(mode: ModePreset) {
 }
 
 /**
- * ✅ 把“用户输入的 opts + .env”整合成最终配置
- * 优先级：opts > env > 默认值
+ * @zh-CN 合并 opts + .env + 默认值，得到最终运行配置。
+ * 优先级：opts > env > defaults
+ *
+ * @en Merge opts + env + defaults into the effective runtime config.
+ * Priority: opts > env > defaults
  */
 function resolveOpenConfig(opts: DBOpenOptions): InternalResolvedConfig {
 	const storageDir =
@@ -246,26 +330,40 @@ function resolveOpenConfig(opts: DBOpenOptions): InternalResolvedConfig {
 }
 
 /**
- * MiniVectorDB（给不想研究 HNSW 参数的人）
+ * @zh-CN MiniVectorDB：一个“开箱即用”的向量检索数据库。
  *
- * 你通常只需要：
- * 1) const db = await MiniVectorDB.open({ storageDir, mode })
- * 2) await db.insert({ id, input, metadata })
- * 3) const results = await db.search(query, { topK })
- * 4) await db.save()
+ * 你可以把它理解为：
+ * - 把文本/图片/向量存进去（insert）
+ * - 用文本/图片/向量来搜相似内容（search）
+ * - metadata 用于过滤与业务扩展
+ *
+ * 内部做了两阶段检索（兼顾速度与准确）：
+ * 1) 快速召回：WASM/HNSW 在量化向量上找候选（快）
+ * 2) 精排校准：用磁盘里的原始 Float32 向量计算真实距离（准）
+ *
+ * @en MiniVectorDB: a practical vector search database.
+ *
+ * Think of it as:
+ * - insert text/images/vectors
+ * - search similar items by text/images/vectors
+ * - metadata for filtering and business payload
+ *
+ * Two-stage retrieval (speed + quality):
+ * 1) Fast recall: WASM/HNSW over quantized vectors
+ * 2) Accurate rerank: true L2 over stored Float32 vectors
  */
 export class MiniVectorDB<TMeta = any> {
-	// =========================
-	// ✅ 用户最关心的：配置与入口
-	// =========================
-
-	/** 打开时最终生效的配置（可用于 debug） */
+	/** @zh-CN 最终生效配置（用于 debug） | @en Effective config (for debugging) */
 	public readonly cfg: InternalResolvedConfig;
 
 	/**
-	 * ✅ 一行打开数据库（推荐用这个）
-	 * - 会自动 init()
-	 * - 会尝试 load()（如果 storageDir 里有 dump.bin）
+	 * @zh-CN 打开数据库（推荐入口）
+	 * - 自动初始化 WASM / 文件句柄 / 元数据
+	 * - 若存在 dump.bin 则自动 load（否则就是空库）
+	 *
+	 * @en Open database (recommended entry)
+	 * - initializes WASM / file handles / metadata
+	 * - auto loads dump.bin if present (otherwise starts empty)
 	 */
 	static async open<TMeta = any>(
 		opts: DBOpenOptions = {},
@@ -285,17 +383,29 @@ export class MiniVectorDB<TMeta = any> {
 	}
 
 	/**
-	 * ✅ 插入一条（input 可以是：向量 / 文本 / 图片 buffer）
+	 * @zh-CN 插入一条数据（最常用）
+	 * @en Insert one item (most common)
 	 */
 	async insert(item: InsertItem<TMeta>): Promise<void> {
 		await this.insertMany([item]);
 	}
 
 	/**
-	 * ✅ 批量插入
-	 * - 新数据会分配 internal_id
-	 * - 向量会写入 vectors.f32.bin
-	 * - ANN（WASM/HNSW）会插入/更新 int8 量化向量
+	 * @zh-CN 批量插入/更新（推荐批量，提高吞吐）
+	 *
+	 * 内部流程（简化版）：
+	 * 1) input -> Float32 向量（必要时自动 embedding + normalize）
+	 * 2) Float32 写入 vectors.f32.bin（用于精排）
+	 * 3) Float32 -> Int8 量化，写入 WASM/HNSW（用于快速召回）
+	 * 4) metadata 写入 metadata.json
+	 *
+	 * @en Batch insert/update (recommended for throughput)
+	 *
+	 * Pipeline (simplified):
+	 * 1) input -> Float32 (auto-embed + normalize when needed)
+	 * 2) persist Float32 into vectors.f32.bin (for rerank)
+	 * 3) quantize Float32 -> Int8, update WASM/HNSW (for fast recall)
+	 * 4) persist metadata into metadata.json
 	 */
 	async insertMany(items: InsertItem<TMeta>[]): Promise<void> {
 		return this.withLock(async () => {
@@ -431,11 +541,27 @@ export class MiniVectorDB<TMeta = any> {
 	}
 
 	/**
-	 * ✅ 搜索（query 可以是：向量 / 文本 / 图片 buffer）
+	 * @zh-CN 相似搜索
 	 *
-	 * 返回结果：
-	 * - id：你插入时给的 external id
-	 * - score：越小越相似（L2 距离平方）
+	 * 工作方式（两阶段）：
+	 * 1) 召回：HNSW 在 int8 量化向量上快速找候选（数量≈ topK * rerankMultiplier）
+	 * 2) 过滤：按 metadata 过滤候选（可选）
+	 * 3) 精排：从磁盘读取候选的 Float32 原始向量，计算真实 L2 并排序（更准）
+	 *
+	 * 返回：
+	 * - id：插入时的 external id
+	 * - score：越小越相似（L2^2）
+	 *
+	 * @en Similarity search
+	 *
+	 * Two-stage:
+	 * 1) recall: HNSW over int8 vectors to get candidates (~ topK * rerankMultiplier)
+	 * 2) optional filtering by metadata
+	 * 3) rerank: read Float32 vectors from disk and compute true L2 for accuracy
+	 *
+	 * Returns:
+	 * - id: external id you inserted
+	 * - score: smaller is closer (L2^2)
 	 */
 	async search(
 		query: InsertItem["input"],
@@ -528,10 +654,15 @@ export class MiniVectorDB<TMeta = any> {
 	}
 
 	/**
-	 * ✅ 保存：
-	 * - metadata.json（Loki）
-	 * - dump.bin（HNSW + 量化向量）
-	 * - vectors.f32.bin（float32 原始向量文件会 sync）
+	 * @zh-CN 保存到磁盘（建议在进程退出前调用）
+	 * - metadata.json：元数据与映射
+	 * - dump.bin：HNSW 图结构 + 量化向量（启动可快速恢复）
+	 * - vectors.f32.bin：原始向量文件会 sync（尽量保证落盘）
+	 *
+	 * @en Persist to disk (call before process exit)
+	 * - metadata.json: metadata & mappings
+	 * - dump.bin: HNSW graph + quantized vectors (fast restore)
+	 * - vectors.f32.bin: fsync for durability
 	 */
 	async save(filePath?: string): Promise<void> {
 		return this.withLock(async () => {
@@ -543,8 +674,13 @@ export class MiniVectorDB<TMeta = any> {
 	}
 
 	/**
-	 * ✅ 加载（默认 storageDir/dump.bin）
-	 * 注意：这只加载 ANN 结构；metadata/vector 文件仍在 storageDir 下
+	 * @zh-CN 从磁盘加载（默认 storageDir/dump.bin）
+	 * 注意：dump.bin 只包含 ANN 结构（HNSW + 量化向量），
+	 * metadata 与 Float32 向量仍来自 storageDir 下对应文件。
+	 *
+	 * @en Load from disk (default storageDir/dump.bin)
+	 * Note: dump.bin contains ANN structures only (HNSW + quantized vectors).
+	 * metadata and Float32 vectors are read from their files under storageDir.
 	 */
 	async load(filePath?: string): Promise<void> {
 		return this.withLock(async () => {
@@ -564,7 +700,8 @@ export class MiniVectorDB<TMeta = any> {
 	}
 
 	/**
-	 * ✅ 返回一些运行信息（用于 debug / 看当前配置）
+	 * @zh-CN 运行信息（用于调试/观测）
+	 * @en Runtime stats (debug/observability)
 	 */
 	getStats() {
 		return {
@@ -580,7 +717,8 @@ export class MiniVectorDB<TMeta = any> {
 	}
 
 	/**
-	 * ✅ 关闭数据库（释放文件句柄/缓存）
+	 * @zh-CN 关闭数据库（释放文件句柄与缓存）
+	 * @en Close DB (release file handles and caches)
 	 */
 	async close(): Promise<void> {
 		return this.withLock(async () => {

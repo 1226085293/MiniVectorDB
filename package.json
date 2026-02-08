@@ -1,29 +1,43 @@
 {
 	"name": "mini-vector-db",
 	"version": "1.0.0",
-	"description": "A lightweight SIMD-optimized vector database using Node.js and AssemblyScript",
+	"description": "MiniVectorDB with HNSW (AssemblyScript WASM) + Local embedder",
+	"license": "MIT",
+	"type": "commonjs",
 	"main": "dist/index.js",
 	"types": "dist/index.d.ts",
+	"exports": {
+		".": {
+			"require": "./dist/index.js",
+			"types": "./dist/index.d.ts"
+		}
+	},
 	"files": [
-		"dist",
-		"build"
+		"dist/**/*",
+		"README.md",
+		"LICENSE",
+		"package.json"
 	],
 	"scripts": {
-		"asbuild:debug": "asc assembly/index.ts --target debug",
-		"asbuild:release": "asc assembly/index.ts --target release",
-		"asbuild": "npm run asbuild:release",
-		"build:ts": "tsc",
-		"build": "npm run asbuild && npm run build:ts",
-		"start": "ts-node src/api/server.ts",
 		"test": "ts-node tests/test.ts",
+		"build": "npm run clean && npm run build:wasm && npm run build:ts && npm run copy:wasm",
+		"clean": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true}); require('fs').rmSync('build',{recursive:true,force:true});\"",
+		"build:wasm": "npx asc assembly/index.ts --config asconfig.json --target release",
+		"build:ts": "npx tsc -p tsconfig.json",
+		"copy:wasm": "node -e \"const fs=require('fs'); const path=require('path'); fs.mkdirSync('dist',{recursive:true}); fs.copyFileSync(path.join('build','release.wasm'), path.join('dist','release.wasm'));\"",
+		"pretest": "npm run build:wasm",
+		"prepack": "npm run build",
 		"generate-md": "node mdg -e ts json -d ./assembly ./src ./asconfig.json ./tsconfig.json"
+	},
+	"publishConfig": {
+		"access": "public"
 	},
 	"dependencies": {
 		"@assemblyscript/loader": "^0.27.0",
-		"@fastify/cors": "^10.0.0",
 		"@xenova/transformers": "^2.16.0",
 		"dotenv": "^17.2.4",
 		"fastify": "^5.0.0",
+		"@fastify/cors": "^10.0.0",
 		"lokijs": "^1.5.12"
 	},
 	"devDependencies": {
@@ -32,6 +46,5 @@
 		"assemblyscript": "^0.27.0",
 		"ts-node": "^10.9.1",
 		"typescript": "^5.0.0"
-	},
-	"type": "commonjs"
+	}
 }

@@ -1,0 +1,10 @@
+src/
+assembly/
+build/
+tests/
+**/*.ts
+**/*.wat
+asconfig.json
+tsconfig.json
+.env
+data/
