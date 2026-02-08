@@ -27,7 +27,8 @@
 		"copy:wasm": "node -e \"const fs=require('fs'); const path=require('path'); fs.mkdirSync('dist',{recursive:true}); fs.copyFileSync(path.join('build','release.wasm'), path.join('dist','release.wasm'));\"",
 		"pretest": "npm run build:wasm",
 		"prepack": "npm run build",
-		"generate-md": "node mdg -e ts json -d ./assembly ./src ./asconfig.json ./tsconfig.json"
+		"generate-md": "node mdg -e ts json -d ./assembly ./src ./asconfig.json ./tsconfig.json",
+		"generate-test-md": "node mdg -e ts -d ./tests"
 	},
 	"publishConfig": {
 		"access": "public"
@@ -35,12 +36,12 @@
 	"dependencies": {
 		"@assemblyscript/loader": "^0.27.0",
 		"@xenova/transformers": "^2.16.0",
-		"dotenv": "^17.2.4",
 		"fastify": "^5.0.0",
 		"@fastify/cors": "^10.0.0",
 		"lokijs": "^1.5.12"
 	},
 	"devDependencies": {
+		"dotenv": "^17.2.4",
 		"@types/lokijs": "^1.5.7",
 		"@types/node": "^18.0.0",
 		"assemblyscript": "^0.27.0",

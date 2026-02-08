@@ -192,10 +192,98 @@ export class WasmBridge {
 		});
 	}
 
+	/**
+	 * ✅ Re-init index without re-instantiating the module.
+	 * Uses reset_memory() to avoid WASM memory growing forever during rebuild loops.
+	 */
+	async reinitIndex(capacity: number): Promise<void> {
+		await this.withLock(() => {
+			const cfg = this.currentConfig;
+			if (!cfg) throw new Error("WasmBridge not initialized");
+
+			if (typeof this.wasmModule.reset_memory === "function")
+				this.wasmModule.reset_memory();
+			else this.wasmModule.init_memory();
+
+			this.scratchI8Ptr = 0;
+			this.scratchI8Cap = 0;
+			this.scratchDumpPtr = 0;
+			this.scratchDumpCap = 0;
+
+			if (typeof this.wasmModule.get_max_ef === "function") {
+				this.wasmMaxEf = Number(this.wasmModule.get_max_ef()) | 0;
+			}
+
+			// idempotent set_config is safe
+			this.wasmModule.set_config(cfg.dim, cfg.m, cfg.ef);
+
+			if (typeof this.wasmModule.set_search_config === "function") {
+				this.wasmModule.set_search_config((cfg.efSearch ?? 50) | 0);
+			}
+			if (typeof this.wasmModule.set_results_cap === "function") {
+				this.wasmModule.set_results_cap(
+					this.clampResultsCap(cfg.resultsCap ?? 1000),
+				);
+			}
+			if (typeof this.wasmModule.seed_rng === "function") {
+				const seed =
+					(cfg.seed != null ? cfg.seed : Date.now() ^ (process.pid << 16)) >>>
+					0;
+				this.wasmModule.seed_rng(seed);
+			}
+
+			this.wasmModule.init_index(capacity);
+			this.ensureScratchI8(cfg.dim);
+
+			this.currentConfig = { ...cfg, capacity };
+		});
+	}
+
 	async insert(id: number, vectorI8: Int8Array): Promise<void> {
 		await this.withLock(() => {
 			const ptr = this.writeVectorI8Reusable(vectorI8);
 			this.wasmModule.insert(id, ptr);
+		});
+	}
+
+	/**
+	 * ✅ Batch insert/update in a single WASM lock.
+	 * NOTE: WASM insert() is "upsert": if node exists -> update_and_reconnect.
+	 */
+	async insertMany(
+		pairs: { id: number; vectorI8: Int8Array }[],
+	): Promise<void> {
+		await this.withLock(() => {
+			for (const p of pairs) {
+				const ptr = this.writeVectorI8Reusable(p.vectorI8);
+				this.wasmModule.insert(p.id, ptr);
+			}
+		});
+	}
+
+	/**
+	 * ✅ Packed batch insert (no per-vector allocations outside).
+	 * ids.length * dim must equal packed.length
+	 */
+	async insertManyPacked(
+		ids: Int32Array,
+		packed: Int8Array,
+		dim: number,
+	): Promise<void> {
+		if (ids.length === 0) return;
+		if (packed.length !== ids.length * dim) {
+			throw new Error(
+				`insertManyPacked length mismatch: packed=${packed.length}, ids=${ids.length}, dim=${dim}`,
+			);
+		}
+
+		await this.withLock(() => {
+			for (let i = 0; i < ids.length; i++) {
+				const id = ids[i];
+				const slice = packed.subarray(i * dim, i * dim + dim);
+				const ptr = this.writeVectorI8Reusable(slice);
+				this.wasmModule.insert(id, ptr);
+			}
 		});
 	}
 
@@ -229,6 +317,40 @@ export class WasmBridge {
 				results.push({ id, dist });
 			}
 			return results;
+		});
+	}
+
+	/**
+	 * ✅ Batch search in a single WASM lock (reduces lock overhead a lot).
+	 */
+	async searchMany(
+		vectorsI8: Int8Array[],
+		k: number,
+	): Promise<{ id: number; dist: number }[][]> {
+		return this.withLock(() => {
+			const out: { id: number; dist: number }[][] = new Array(vectorsI8.length);
+
+			for (let qi = 0; qi < vectorsI8.length; qi++) {
+				const ptr = this.writeVectorI8Reusable(vectorsI8[qi]);
+				const count = this.wasmModule.search(ptr, k);
+				if (count === 0) {
+					out[qi] = [];
+					continue;
+				}
+
+				const resultsPtr = this.wasmModule.get_results_ptr();
+				const view = new DataView(this.memory.buffer, resultsPtr, count * 8);
+
+				const results: { id: number; dist: number }[] = [];
+				for (let i = 0; i < count; i++) {
+					const id = view.getInt32(i * 8, true);
+					const dist = view.getFloat32(i * 8 + 4, true);
+					results.push({ id, dist });
+				}
+				out[qi] = results;
+			}
+
+			return out;
 		});
 	}
 
@@ -309,7 +431,6 @@ export class WasmBridge {
 					this.wasmMaxEf = Number(this.wasmModule.get_max_ef()) | 0;
 				}
 
-				// config 允许幂等设置
 				const cfg = this.currentConfig;
 				if (cfg) {
 					this.wasmModule.set_config(cfg.dim, cfg.m, cfg.ef);
@@ -334,7 +455,7 @@ export class WasmBridge {
 				const ok: number = this.wasmModule.load_index(ptr, buf.length);
 				if (!ok) {
 					throw new Error(
-						"WASM load_index failed (dump format mismatch / config mismatch / corrupt dump).",
+						"WASM load_index failed (format mismatch / config mismatch / corrupt dump).",
 					);
 				}
 

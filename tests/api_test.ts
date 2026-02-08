@@ -6,14 +6,12 @@ import net from "net";
 import os from "os";
 import fs from "fs";
 
-// 加载本地 .env 配置
 dotenv.config({ path: path.join(__dirname, "../.env") });
 
 function delay(ms: number) {
 	return new Promise((r) => setTimeout(r, ms));
 }
 
-// 获取随机可用端口
 function getAvailablePort(): Promise<number> {
 	return new Promise((resolve, reject) => {
 		const server = net.createServer();
@@ -25,7 +23,6 @@ function getAvailablePort(): Promise<number> {
 	});
 }
 
-// Windows 下必须杀进程树（npx/ts-node 经常还有子进程）
 async function killProcessTree(pid: number) {
 	if (!pid) return;
 
@@ -55,17 +52,34 @@ async function waitExitOrKill(proc: any, timeoutMs: number) {
 	await killProcessTree(proc.pid ?? 0);
 }
 
+async function fetchWithTimeout(url: string, init: any = {}, timeoutMs = 8000) {
+	const controller = new AbortController();
+	const tid = setTimeout(() => controller.abort(), timeoutMs);
+	try {
+		return await fetch(url, { ...init, signal: controller.signal });
+	} finally {
+		clearTimeout(tid);
+	}
+}
+
+async function readJsonOrText(resp: Response) {
+	const text = await resp.text().catch(() => "");
+	try {
+		return { json: JSON.parse(text), text };
+	} catch {
+		return { json: null, text };
+	}
+}
+
 async function main() {
 	console.log("--- API TEST START (v2 API) ---");
 
 	const TEST_PORT = await getAvailablePort();
 	console.log(`Using port: ${TEST_PORT}`);
 
-	// ✅ 这个测试走“数值向量直传”，所以 dim 取 env 或默认 384
 	const vectorDim = parseInt(process.env.VECTOR_DIM || "384", 10);
 	console.log(`Using VECTOR_DIM: ${vectorDim}`);
 
-	// ✅ 用临时目录，避免污染 data/
 	const storageDir = path.join(
 		os.tmpdir(),
 		`minivectordb-api-test-${Date.now()}`,
@@ -84,20 +98,13 @@ async function main() {
 			API_PORT: TEST_PORT.toString(),
 			API_HOST: "127.0.0.1",
 			NODE_ENV: "test",
-
-			// ✅ v2 server.ts 读取 MINIVECTOR_STORAGE_DIR
 			MINIVECTOR_STORAGE_DIR: storageDir,
-
-			// ✅ 强制维度匹配（MiniVectorDB.open 会读 VECTOR_DIM）
 			VECTOR_DIM: String(vectorDim),
-
-			// ✅ 避免用户本地 .env 把它切到 clip 模型导致 dim 推断冲突
-			// 这里强制 text 模型（只影响“字符串输入”，我们测试数值向量不依赖它）
 			MODEL_NAME: process.env.MODEL_NAME || "Xenova/all-MiniLM-L6-v2",
 		},
 	});
 
-	const serverUrl = `http://localhost:${TEST_PORT}`;
+	const serverUrl = `http://127.0.0.1:${TEST_PORT}`;
 	let outputBuffer = "";
 
 	serverProcess.stdout?.on("data", (data: Buffer) => {
@@ -153,69 +160,138 @@ async function main() {
 	}
 
 	try {
+		// 0) sanity /stats
+		console.log("Checking /stats ...");
+		const statsResp = await fetchWithTimeout(`${serverUrl}/stats`, {}, 8000);
+		const statsPayload = await readJsonOrText(statsResp);
+		if (statsResp.status !== 200) {
+			console.error("Stats failed:", statsPayload.text);
+			throw new Error("/stats failed");
+		}
+
+		// 1) insert
 		console.log(`Testing /insert with ${vectorDim} dim numeric vector...`);
+		const insertResp = await fetchWithTimeout(
+			`${serverUrl}/insert`,
+			{
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({
+					id: "api-test-1",
+					input: new Array(vectorDim).fill(0.1),
+					metadata: { type: "api-test", phase: "inserted" },
+				}),
+			},
+			8000,
+		);
 
-		// ✅ v2: /insert body uses { id, input, metadata }
-		const insertResp = await fetch(`${serverUrl}/insert`, {
-			method: "POST",
-			headers: { "Content-Type": "application/json" },
-			body: JSON.stringify({
-				id: "api-test-1",
-				input: new Array(vectorDim).fill(0.1),
-				metadata: { type: "api-test" },
-			}),
-		});
-
+		const insertPayload = await readJsonOrText(insertResp);
 		if (insertResp.status !== 200) {
-			const errData = await insertResp.json().catch(() => ({}));
-			console.error("Insert failed:", errData);
+			console.error("Insert failed:", insertPayload.text);
 			throw new Error("API Insert Failed");
 		}
 
-		console.log("Testing /search ...");
+		// 2) search must find id
+		console.log("Testing /search (no filter) ...");
+		const searchResp1 = await fetchWithTimeout(
+			`${serverUrl}/search`,
+			{
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({
+					query: new Array(vectorDim).fill(0.1),
+					topK: 3,
+				}),
+			},
+			8000,
+		);
 
-		// ✅ v2: /search body uses { query, topK, filter }
-		const searchResp = await fetch(`${serverUrl}/search`, {
-			method: "POST",
-			headers: { "Content-Type": "application/json" },
-			body: JSON.stringify({
-				query: new Array(vectorDim).fill(0.1),
-				topK: 1,
-			}),
-		});
-
-		if (searchResp.status !== 200) {
-			const errData = await searchResp.json().catch(() => ({}));
-			console.error("Search failed:", errData);
+		const searchPayload1 = await readJsonOrText(searchResp1);
+		if (searchResp1.status !== 200) {
+			console.error("Search failed:", searchPayload1.text);
 			throw new Error("API Search Failed");
 		}
 
-		const searchData: any = await searchResp.json();
-
-		if (searchData.results && searchData.results[0]?.id === "api-test-1") {
-			console.log("✅ API TEST PASSED!");
+		const s1 = (searchPayload1.json ?? {}) as any;
+		const results1 = s1?.results ?? s1; // 兼容：有的实现直接返回数组
+		if (
+			Array.isArray(results1) &&
+			results1.some((x: any) => x?.id === "api-test-1")
+		) {
+			console.log("✅ Search returned inserted id.");
 		} else {
-			console.error("Search results:", searchData);
-			throw new Error("API Search mismatch");
+			console.error("Search results payload:", searchPayload1.text);
+			throw new Error("API Search mismatch (did not find api-test-1)");
 		}
 
-		// (可选) 测一下 /stats 不挂
-		const statsResp = await fetch(`${serverUrl}/stats`);
-		const stats = await statsResp.json().catch(() => ({}));
-		console.log("[stats endpoint]", stats);
-	} catch (e) {
-		console.error("❌ API TEST FAILED:", e);
+		// 3) updateMetadata（如果你实现了该端点）
+		console.log("Testing /updateMetadata ...");
+		const updResp = await fetchWithTimeout(
+			`${serverUrl}/updateMetadata`,
+			{
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({
+					id: "api-test-1",
+					metadata: { type: "api-test", phase: "updated" },
+				}),
+			},
+			8000,
+		);
+
+		const updPayload = await readJsonOrText(updResp);
+		if (updResp.status !== 200) {
+			console.error("updateMetadata failed:", updPayload.text);
+			throw new Error("API updateMetadata failed");
+		}
+
+		// 4) search again (this is where your log previously “hangs”)
+		console.log("Testing /search after updateMetadata (with timeout) ...");
+		const searchResp2 = await fetchWithTimeout(
+			`${serverUrl}/search`,
+			{
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({
+					query: new Array(vectorDim).fill(0.1),
+					topK: 3,
+					// 如果你实现 filter，这里可以逐步加断言；先不强绑定 filter 语法
+					// filter: { type: "api-test" },
+				}),
+			},
+			8000,
+		);
+
+		const searchPayload2 = await readJsonOrText(searchResp2);
+		if (searchResp2.status !== 200) {
+			console.error("Search2 failed:", searchPayload2.text);
+			throw new Error("API Search2 Failed");
+		}
+
+		const s2 = (searchPayload2.json ?? {}) as any;
+		const results2 = s2?.results ?? s2;
+		if (
+			Array.isArray(results2) &&
+			results2.some((x: any) => x?.id === "api-test-1")
+		) {
+			console.log("✅ Search after updateMetadata returned inserted id.");
+		} else {
+			console.error("Search2 results payload:", searchPayload2.text);
+			throw new Error("API Search2 mismatch (did not find api-test-1)");
+		}
+
+		console.log("✅ API TEST PASSED!");
+	} catch (e: any) {
+		console.error("❌ API TEST FAILED:", e?.stack || e);
 		process.exitCode = 1;
 	} finally {
-		// ✅ 先请求 shutdown（忽略错误）
+		// shutdown best-effort
 		try {
-			await fetch(`${serverUrl}/shutdown`, { method: "POST" });
+			await fetchWithTimeout(`${serverUrl}/shutdown`, { method: "POST" }, 3000);
 		} catch {}
 
-		// ✅ 限时等待 server 退出，超时就杀树（否则 test 永远挂着）
 		await waitExitOrKill(serverProcess, 8000);
 
-		// ✅ best-effort 清理临时目录
 		try {
 			fs.rmSync(storageDir, { recursive: true, force: true });
 		} catch {}

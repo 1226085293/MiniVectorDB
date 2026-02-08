@@ -2,10 +2,7 @@
 import Fastify, { FastifyInstance } from "fastify";
 import cors from "@fastify/cors";
 import path from "path";
-import dotenv from "dotenv";
 import { MiniVectorDB } from "../index";
-
-dotenv.config({ path: path.join(__dirname, "../../.env") });
 
 const server: FastifyInstance = Fastify({
 	logger: true,
@@ -15,14 +12,39 @@ const server: FastifyInstance = Fastify({
 
 type InsertBody = {
 	id: string;
-	input: any; // string | number[] | ...
+	input: any;
 	metadata?: any;
 };
 
 type SearchBody = {
-	query: any; // string | number[] | ...
+	query: any;
 	topK?: number;
-	filter?: any; // Loki query
+	filter?: any;
+	score?: "l2" | "cosine" | "similarity";
+};
+
+type SearchManyBody = {
+	queries: any[];
+	topK?: number;
+	filter?: any;
+	score?: "l2" | "cosine" | "similarity";
+};
+
+type RemoveBody = {
+	id?: string;
+	ids?: string[];
+};
+
+type UpdateMetadataBody = {
+	id: string;
+	metadata: any;
+	merge?: boolean;
+};
+
+type RebuildBody = {
+	capacity?: number;
+	persist?: boolean;
+	compact?: boolean; // ✅ NEW
 };
 
 const STORAGE_DIR =
@@ -59,6 +81,7 @@ async function start() {
 
 	db = await MiniVectorDB.open({
 		storageDir: STORAGE_DIR,
+		collection: process.env.MINIVECTOR_COLLECTION || undefined,
 		modelName: process.env.MODEL_NAME,
 		mode: (process.env.MINIVECTOR_MODE as any) || "balanced",
 		capacity: process.env.HNSW_CAPACITY
@@ -70,17 +93,52 @@ async function start() {
 	server.post<{ Body: InsertBody }>("/insert", async (request, reply) => {
 		const { id, input, metadata } = request.body;
 		if (!id) return reply.code(400).send({ error: "Missing id" });
-
 		await db.insert({ id, input, metadata });
 		return { status: "ok" };
 	});
 
 	server.post<{ Body: SearchBody }>("/search", async (request, reply) => {
-		const { query, topK = 10, filter } = request.body;
+		const { query, topK = 10, filter, score } = request.body;
 		if (query == null) return reply.code(400).send({ error: "Missing query" });
-
-		const results = await db.search(query, { topK, filter });
+		const results = await db.search(query, { topK, filter, score });
 		return { results };
+	});
+
+	server.post<{ Body: SearchManyBody }>(
+		"/searchMany",
+		async (request, reply) => {
+			const { queries, topK = 10, filter, score } = request.body;
+			if (!Array.isArray(queries) || queries.length === 0) {
+				return reply.code(400).send({ error: "Missing queries[]" });
+			}
+			const results = await db.searchMany(queries, { topK, filter, score });
+			return { results };
+		},
+	);
+
+	server.post<{ Body: RemoveBody }>("/remove", async (request, reply) => {
+		const ids = request.body.ids || (request.body.id ? [request.body.id] : []);
+		if (!ids.length) return reply.code(400).send({ error: "Missing id/ids" });
+
+		const r = await db.removeMany(ids);
+		return { status: "ok", ...r };
+	});
+
+	server.post<{ Body: UpdateMetadataBody }>(
+		"/updateMetadata",
+		async (request, reply) => {
+			const { id, metadata, merge } = request.body;
+			if (!id) return reply.code(400).send({ error: "Missing id" });
+
+			const ok = await db.updateMetadata(id, metadata, { merge });
+			return { status: ok ? "ok" : "not_found" };
+		},
+	);
+
+	server.post<{ Body: RebuildBody }>("/rebuild", async (request) => {
+		const { capacity, persist, compact } = request.body || {};
+		const r = await db.rebuild({ capacity, persist, compact });
+		return { status: "ok", ...r };
 	});
 
 	server.post("/save", async () => {

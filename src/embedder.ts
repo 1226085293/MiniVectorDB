@@ -1,4 +1,6 @@
+// src/embedder.ts
 import {
+	env,
 	pipeline,
 	RawImage,
 	AutoProcessor,
@@ -12,10 +14,21 @@ import { fileURLToPath } from "url";
 
 export type ModelArchitecture = "text" | "clip";
 
-/**
- * @zh-CN 本地嵌入模型包装类。
- * @en Local embedding model wrapper.
- */
+export type LocalEmbedderOptions = {
+	/**
+	 * ✅ 模型缓存目录（离线/预热/复用）
+	 * - Node 环境下，@xenova/transformers 会把模型权重与 tokenizer 等缓存到 cacheDir。
+	 * - 你可以预先把该目录打包到镜像里，实现“离线启动”。
+	 */
+	cacheDir?: string;
+
+	/**
+	 * ✅ 如果你把模型文件预放在 cacheDir，并希望避免联网，可开启：
+	 * （不同 transformers 版本行为可能略不同，但 env.localModelPath/env.allowLocalModels 通常可用）
+	 */
+	localFilesOnly?: boolean;
+};
+
 export class LocalEmbedder {
 	private pipe: any = null;
 	private modelName: string;
@@ -27,12 +40,18 @@ export class LocalEmbedder {
 	private textModel: any = null;
 
 	private initPromise: Promise<void> | null = null;
+	private opts: LocalEmbedderOptions;
 
-	constructor(modelName: string, architecture?: ModelArchitecture) {
+	constructor(
+		modelName: string,
+		architecture?: ModelArchitecture,
+		opts: LocalEmbedderOptions = {},
+	) {
 		this.modelName = modelName;
 		this.architecture =
 			architecture ||
 			(modelName.toLowerCase().includes("clip") ? "clip" : "text");
+		this.opts = opts;
 	}
 
 	private isLikelyImagePath(p: string): boolean {
@@ -45,6 +64,17 @@ export class LocalEmbedder {
 
 		this.initPromise = (async () => {
 			try {
+				if (this.opts.cacheDir) {
+					env.cacheDir = this.opts.cacheDir;
+				}
+				if (this.opts.localFilesOnly) {
+					// Best-effort flags (may vary by transformers.js version)
+					// @ts-ignore
+					env.allowLocalModels = true;
+					// @ts-ignore
+					env.useBrowserCache = false;
+				}
+
 				console.log(
 					`Loading embedding model [${this.architecture}]: ${this.modelName}...`,
 				);
@@ -64,6 +94,7 @@ export class LocalEmbedder {
 					// @ts-ignore
 					this.pipe = await pipeline("feature-extraction", this.modelName);
 				}
+
 				console.log("Model loaded successfully.");
 			} catch (error) {
 				this.initPromise = null;
@@ -77,14 +108,7 @@ export class LocalEmbedder {
 	async embed(input: any): Promise<Float32Array> {
 		await this.init();
 
-		// ✅ FIX: avoid mis-detecting plain text that happens to be a file path
-		// Treat as image only if:
-		// - Buffer/Uint8Array
-		// - http(s) URL
-		// - file:// URL whose path looks like an image
-		// - existing local path with common image extension
 		let isImageSrc = input instanceof Buffer || input instanceof Uint8Array;
-
 		let normalizedInput = input;
 
 		if (!isImageSrc && typeof input === "string") {
@@ -99,15 +123,12 @@ export class LocalEmbedder {
 						isImageSrc = true;
 						normalizedInput = localPath;
 					}
-				} catch {
-					// ignore, treat as text
-				}
+				} catch {}
 			} else if (fs.existsSync(s) && this.isLikelyImagePath(s)) {
 				isImageSrc = true;
 			}
 		}
 
-		// --- CLIP 多模态处理 ---
 		if (this.architecture === "clip") {
 			if (isImageSrc) {
 				const image = await RawImage.read(normalizedInput as any);
@@ -124,7 +145,6 @@ export class LocalEmbedder {
 			}
 		}
 
-		// --- 标准文本模型处理 ---
 		const output = await this.pipe(normalizedInput, {
 			pooling: "mean",
 			normalize: true,
