@@ -2,6 +2,7 @@
 	"name": "mini-vector-db",
 	"version": "1.0.0",
 	"description": "MiniVectorDB with HNSW (AssemblyScript WASM) + Local embedder",
+	"repository": "github:1226085293/MiniVectorDB",
 	"license": "MIT",
 	"type": "commonjs",
 	"main": "dist/index.js",
